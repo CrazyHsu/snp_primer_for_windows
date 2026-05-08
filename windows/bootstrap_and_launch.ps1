@@ -1,0 +1,440 @@
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$AppRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+)
+
+$ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$AppDataRoot = Join-Path (Resolve-Path $AppRoot).Path "snp_primer_runtime"
+$RuntimeRoot = $AppDataRoot
+$PythonRoot = Join-Path $AppDataRoot "python311"
+$VenvRoot = Join-Path $AppDataRoot "venv"
+$BinRoot = Join-Path $AppDataRoot "bin"
+$WorkspaceRoot = Join-Path $AppDataRoot "workspace"
+$ReferenceRoot = Join-Path $AppDataRoot "references"
+$DownloadsRoot = Join-Path $AppDataRoot "downloads"
+$TempRoot = Join-Path $AppDataRoot "tmp"
+$BootstrapLog = Join-Path $AppDataRoot "bootstrap.log"
+$PythonInstallerUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+$BlastTarUrl = "https://ftp.ncbi.nlm.nih.gov/blast/executables/LATEST/ncbi-blast-2.17.0+-x64-win64.tar.gz"
+
+function Write-Status {
+    param([string]$Message)
+    Write-Host "[SNPPrimer] $Message"
+}
+
+function Ensure-Directory {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+}
+
+function Invoke-Download {
+    param(
+        [string]$Url,
+        [string]$OutFile
+    )
+    if (Test-Path -LiteralPath $OutFile) {
+        return
+    }
+    Write-Status "Downloading $Url"
+    Invoke-WebRequest -Uri $Url -OutFile $OutFile
+}
+
+function Invoke-Checked {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$Description
+    )
+    Write-Status $Description
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Get-ExistingPython {
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        try {
+            $pythonPath = & $pyLauncher.Source -3.11 -c "import sys; print(sys.executable)"
+            if ($LASTEXITCODE -eq 0 -and $pythonPath) {
+                return $pythonPath.Trim()
+            }
+        }
+        catch {
+        }
+    }
+
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        try {
+            $versionText = & $python.Source -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"
+            if ($LASTEXITCODE -eq 0 -and $versionText) {
+                $parts = $versionText.Trim().Split(".")
+                if ([int]$parts[0] -gt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge 11)) {
+                    return $python.Source
+                }
+            }
+        }
+        catch {
+        }
+    }
+
+    return $null
+}
+
+function Ensure-LocalPython {
+    $ExistingPython = Get-ExistingPython
+    if ($ExistingPython) {
+        Write-Status "Using existing Python: $ExistingPython"
+        return $ExistingPython
+    }
+
+    $PythonExe = Join-Path $PythonRoot "python.exe"
+    if (Test-Path -LiteralPath $PythonExe) {
+        return $PythonExe
+    }
+
+    Ensure-Directory (Split-Path -Parent $PythonRoot)
+    Ensure-Directory $DownloadsRoot
+    $Installer = Join-Path $DownloadsRoot "python-3.11.9-amd64.exe"
+    Invoke-Download -Url $PythonInstallerUrl -OutFile $Installer
+    Write-Status "Installing local Python runtime"
+    $InstallProcess = Start-Process -FilePath $Installer -ArgumentList @(
+        "/passive",
+        "InstallAllUsers=0",
+        "TargetDir=$PythonRoot",
+        "Include_exe=1",
+        "Include_lib=1",
+        "Include_dev=1",
+        "Include_pip=1",
+        "Include_tcltk=1",
+        "Include_launcher=0",
+        "InstallLauncherAllUsers=0",
+        "AssociateFiles=0",
+        "Shortcuts=0",
+        "PrependPath=0",
+        "AppendPath=0",
+        "Include_test=0",
+        "CompileAll=0",
+        "SimpleInstall=0"
+    ) -Wait -PassThru
+    if ($InstallProcess.ExitCode -ne 0) {
+        throw "Python installer failed with exit code $($InstallProcess.ExitCode)"
+    }
+    if (-not (Test-Path -LiteralPath $PythonExe)) {
+        throw "Failed to install Python runtime into $PythonRoot"
+    }
+    return $PythonExe
+}
+
+function Ensure-Venv {
+    param([string]$PythonExe)
+    $VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $VenvPython)) {
+        Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "venv", $VenvRoot) -Description "Creating virtual environment"
+    }
+    return $VenvPython
+}
+
+function Ensure-ProjectInstalled {
+    param([string]$VenvPython)
+    Invoke-Checked -FilePath $VenvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip") -Description "Upgrading pip"
+    # NOTE: v5 now uses the primer3_core binary + upstream global_settings.txt
+    # (see core/getCAPS.py and Ensure-Primer3Core). primer3-py is no longer needed.
+    Invoke-Checked -FilePath $VenvPython -Arguments @("-m", "pip", "install", "--upgrade", "--editable", $AppRoot) -Description "Installing SNP Primer app"
+}
+
+function Ensure-BlastTools {
+    # NCBI BLAST+ ships a few helper DLLs alongside the .exe (nghttp2.dll for
+    # blastn HTTP/2, ncbi-vdb-md.dll for SRA/DB ops). They MUST sit in the same
+    # directory as the .exe -- otherwise blastn.exe fails to load with
+    # 0xC0000135 STATUS_DLL_NOT_FOUND, with no visible error message.
+    # Earlier versions of this script only copied the .exe and missed these.
+    if (
+        (Test-Path -LiteralPath (Join-Path $BinRoot "blastn.exe")) -and
+        (Test-Path -LiteralPath (Join-Path $BinRoot "blastdbcmd.exe")) -and
+        (Test-Path -LiteralPath (Join-Path $BinRoot "makeblastdb.exe")) -and
+        (Test-Path -LiteralPath (Join-Path $BinRoot "nghttp2.dll"))
+    ) {
+        return
+    }
+
+    Ensure-Directory (Split-Path -Parent $BootstrapLog)
+    Ensure-Directory $BinRoot
+    Ensure-Directory $DownloadsRoot
+    Ensure-Directory $TempRoot
+    $TarPath = Join-Path $DownloadsRoot "ncbi-blast-x64-win64.tar.gz"
+    $ExtractRoot = Join-Path $TempRoot "blast_extract"
+    Invoke-Download -Url $BlastTarUrl -OutFile $TarPath
+    if (Test-Path -LiteralPath $ExtractRoot) {
+        Remove-Item -LiteralPath $ExtractRoot -Recurse -Force
+    }
+    Ensure-Directory $ExtractRoot
+    Invoke-Checked -FilePath "tar" -Arguments @("-xf", $TarPath, "-C", $ExtractRoot) -Description "Extracting BLAST+"
+    $BlastBin = Get-ChildItem -Path $ExtractRoot -Directory | Select-Object -First 1
+    if (-not $BlastBin) {
+        throw "Could not unpack BLAST+ archive"
+    }
+    $SrcBin = Join-Path $BlastBin.FullName "bin"
+    # Copy every .exe and .dll from the extracted bin/ into our $BinRoot.
+    # Future-proofs against NCBI adding more bundled DLLs.
+    Get-ChildItem -Path $SrcBin -File | Where-Object {
+        $_.Extension -in @(".exe", ".dll")
+    } | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $BinRoot $_.Name) -Force
+    }
+}
+
+function Ensure-Primer3Core {
+    # v5 uses the primer3_core binary + upstream global_settings.txt (not primer3-py).
+    # The upstream SNP_Primer_Pipeline repo ships a Windows-compatible primer3_core.exe.
+    if (-not $BinRoot) {
+        throw "Ensure-Primer3Core: BinRoot is null. Bootstrap variable scope is broken."
+    }
+    Ensure-Directory $BinRoot
+    $Primer3Exe = Join-Path $BinRoot "primer3_core.exe"
+    if (Test-Path -LiteralPath $Primer3Exe) {
+        try {
+            $Size = (Get-Item -LiteralPath $Primer3Exe).Length
+            if ($Size -gt 0) { return }
+            Remove-Item -LiteralPath $Primer3Exe -Force  # 0-byte WSL leftover
+        } catch {}
+    }
+    Write-Status "Downloading primer3_core.exe from pinbo/SNP_Primer_Pipeline"
+    $Url = "https://raw.githubusercontent.com/pinbo/SNP_Primer_Pipeline/master/bin/primer3_core.exe"
+    Invoke-WebRequest -Uri $Url -OutFile $Primer3Exe
+    if (-not (Test-Path -LiteralPath $Primer3Exe)) {
+        throw "Failed to download primer3_core.exe to $BinRoot"
+    }
+}
+
+function Remove-LinuxJunkBinaries {
+    # Earlier WSL test sessions may have left 0-byte "broken Linux symlinks" inside
+    # bin/, sharing names with the Windows .exe (e.g. blastn vs blastn.exe). They
+    # would trick core.pipeline._which() into returning a non-PE path, which
+    # Windows then refuses to execute -> [WinError 1920]. Clean them up here.
+    if (-not $BinRoot) { return }
+    if (-not (Test-Path -LiteralPath $BinRoot)) { return }
+    $Names = @("blastn", "blastdbcmd", "makeblastdb", "muscle", "muscle5", "primer3_core")
+    foreach ($n in $Names) {
+        $p = Join-Path $BinRoot $n
+        if (Test-Path -LiteralPath $p) {
+            try {
+                $Size = (Get-Item -LiteralPath $p).Length
+                if ($Size -eq 0) {
+                    Write-Status "Removing 0-byte WSL leftover: $p"
+                    Remove-Item -LiteralPath $p -Force
+                }
+            } catch {}
+        }
+    }
+}
+
+function Test-VCRedistInstalled {
+    # Microsoft Visual C++ 2015-2022 Redistributable (x64) writes this registry
+    # key on install. Both VC 14.0 (2015) and 14.x (2017/2019/2022) report under
+    # the "VC\Runtimes\x64" subtree -- they are binary-compatible by design.
+    $Key = "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+    if (-not (Test-Path -LiteralPath $Key)) { return $false }
+    try {
+        $val = Get-ItemProperty -Path $Key -Name "Installed" -ErrorAction Stop
+        return ($val.Installed -eq 1)
+    } catch {
+        return $false
+    }
+}
+
+function Install-VCRedist {
+    Write-Status "Microsoft Visual C++ Redistributable not detected; downloading installer..."
+    Ensure-Directory $DownloadsRoot
+    $Url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    $InstallerPath = Join-Path $DownloadsRoot "vc_redist.x64.exe"
+    if (-not (Test-Path -LiteralPath $InstallerPath)) {
+        Invoke-WebRequest -Uri $Url -OutFile $InstallerPath -UseBasicParsing
+    }
+    Write-Host ""
+    Write-Host "==============================================================" -ForegroundColor Yellow
+    Write-Host " About to install Microsoft Visual C++ Redistributable (x64)." -ForegroundColor Yellow
+    Write-Host " Windows will prompt for administrator approval (UAC dialog)." -ForegroundColor Yellow
+    Write-Host " This is required so blastn / primer3_core / muscle can run." -ForegroundColor Yellow
+    Write-Host "==============================================================" -ForegroundColor Yellow
+    Write-Host ""
+    try {
+        $proc = Start-Process -FilePath $InstallerPath `
+            -ArgumentList @("/install", "/quiet", "/norestart") `
+            -Verb RunAs -Wait -PassThru
+        $code = $proc.ExitCode
+    } catch {
+        throw ("Could not run VC++ Redistributable installer: " + $_.Exception.Message + `
+               ". Please install manually: https://aka.ms/vs/17/release/vc_redist.x64.exe")
+    }
+    # 0 = success, 1638 = newer version already installed, 3010 = success but reboot needed
+    if ($code -eq 0 -or $code -eq 1638) {
+        Write-Status "VC++ Redistributable installed."
+        return
+    }
+    if ($code -eq 3010) {
+        Write-Host ""
+        Write-Host "VC++ Redistributable installed, but Windows needs a REBOOT before BLAST can run." -ForegroundColor Yellow
+        Write-Host "Please reboot, then re-run Launch SNP Primer Desktop.cmd." -ForegroundColor Yellow
+        Write-Host ""
+        throw "VC++ Redistributable installed but reboot required"
+    }
+    throw ("VC++ Redistributable installer returned exit code " + $code + `
+           ". Try installing manually: https://aka.ms/vs/17/release/vc_redist.x64.exe")
+}
+
+function Ensure-VCRedist {
+    if (Test-VCRedistInstalled) {
+        Write-Status "Microsoft Visual C++ Redistributable detected"
+        return
+    }
+    Install-VCRedist
+    if (-not (Test-VCRedistInstalled)) {
+        throw "VC++ Redistributable still not detected after install attempt - reboot may be required"
+    }
+}
+
+function Test-BinaryRunnable {
+    # Smoke-test a Windows .exe by launching it with a harmless flag (e.g. -version)
+    # and inspecting the exit code. The point is to catch 0xC0000135
+    # (STATUS_DLL_NOT_FOUND) up front, which happens when Microsoft Visual C++
+    # Redistributable is not installed - NCBI BLAST+ / primer3 / muscle all link
+    # against vcruntime140.dll / msvcp140.dll. Without VC++ Redist the .exe
+    # cannot start and the error surface (in the GUI) is an empty stderr +
+    # returncode 3221225781, which is impossible for a user to diagnose.
+    param([string]$Path, [string]$Name, [string[]]$VersionArgs)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "$Name binary not found at $Path"
+    }
+    Write-Status ("Smoke-testing " + $Name)
+    $tmpOut = [System.IO.Path]::GetTempFileName()
+    $tmpErr = [System.IO.Path]::GetTempFileName()
+    try {
+        $proc = Start-Process -FilePath $Path -ArgumentList $VersionArgs `
+            -NoNewWindow -PassThru -Wait `
+            -RedirectStandardOutput $tmpOut `
+            -RedirectStandardError $tmpErr
+        $code = $proc.ExitCode
+    } catch {
+        throw ("$Name could not be launched: " + $_.Exception.Message)
+    } finally {
+        Remove-Item -LiteralPath $tmpOut, $tmpErr -ErrorAction SilentlyContinue
+    }
+    if ($code -eq 0) { return }
+    # 0xC0000135 = -1073741515 (signed int32) = 3221225781 (unsigned uint32).
+    # PowerShell may surface either depending on environment.
+    if ($code -eq -1073741515 -or $code -eq 3221225781) {
+        Write-Host ""
+        Write-Host ("ERROR: " + $Name + " failed to start (0xC0000135 STATUS_DLL_NOT_FOUND).") -ForegroundColor Red
+        Write-Host "  Microsoft Visual C++ 2015-2022 Redistributable (x64) is required but missing." -ForegroundColor Red
+        Write-Host "  Download and install from:" -ForegroundColor Red
+        Write-Host "    https://aka.ms/vs/17/release/vc_redist.x64.exe" -ForegroundColor Yellow
+        Write-Host "  Then re-run Launch SNP Primer Desktop.cmd." -ForegroundColor Red
+        Write-Host ""
+        throw ($Name + " unrunnable - install VC++ Redistributable first")
+    }
+    # Some tools (e.g. muscle) may return non-zero on -version. Only treat
+    # actual launch failure (negative status code) as fatal; otherwise warn
+    # and continue.
+    if ($code -lt 0 -or $code -gt 1000000) {
+        throw ("$Name returned exit code " + $code + " (likely Windows NTSTATUS error)")
+    }
+    Write-Status ("  " + $Name + " smoke test exit=" + $code + ", continuing")
+}
+
+function Ensure-Muscle {
+    $MuscleExe = Join-Path $BinRoot "muscle.exe"
+    if (Test-Path -LiteralPath $MuscleExe) {
+        return
+    }
+    Ensure-Directory $BinRoot
+    Write-Status "Downloading MUSCLE latest Windows release"
+    $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/rcedgar/muscle/releases/latest"
+    $Asset = $Release.assets | Where-Object {
+        $_.name -match "win" -and ($_.name -match "\.exe$" -or $_.name -match "\.zip$")
+    } | Select-Object -First 1
+    if (-not $Asset) {
+        throw "Could not find a Windows MUSCLE asset in the latest GitHub release."
+    }
+    Ensure-Directory $DownloadsRoot
+    Ensure-Directory $TempRoot
+    $AssetPath = Join-Path $DownloadsRoot $Asset.name
+    Invoke-Download -Url $Asset.browser_download_url -OutFile $AssetPath
+    if ($Asset.name -match "\.zip$") {
+        $ExtractRoot = Join-Path $TempRoot "muscle_extract"
+        if (Test-Path -LiteralPath $ExtractRoot) {
+            Remove-Item -LiteralPath $ExtractRoot -Recurse -Force
+        }
+        Expand-Archive -LiteralPath $AssetPath -DestinationPath $ExtractRoot
+        $Found = Get-ChildItem -Path $ExtractRoot -Filter "muscle*.exe" -Recurse | Select-Object -First 1
+        if (-not $Found) {
+            throw "Downloaded MUSCLE archive but no muscle.exe was found."
+        }
+        Copy-Item -LiteralPath $Found.FullName -Destination $MuscleExe -Force
+        return
+    }
+    Copy-Item -LiteralPath $AssetPath -Destination $MuscleExe -Force
+}
+
+Ensure-Directory $RuntimeRoot
+Ensure-Directory (Split-Path -Parent $PythonRoot)
+Ensure-Directory $DownloadsRoot
+Ensure-Directory $TempRoot
+Ensure-Directory $WorkspaceRoot
+Ensure-Directory $ReferenceRoot
+
+Start-Transcript -Path $BootstrapLog -Append | Out-Null
+try {
+    $PythonExe = Ensure-LocalPython
+    $VenvPython = Ensure-Venv -PythonExe $PythonExe
+    Ensure-ProjectInstalled -VenvPython $VenvPython
+    Remove-LinuxJunkBinaries
+    Ensure-BlastTools
+    Ensure-Muscle
+    Ensure-Primer3Core
+
+    # Visual C++ Runtime is required for all three .exe tools above. Detect
+    # via registry; if missing, prompt for elevation and install silently.
+    Ensure-VCRedist
+
+    # Catch missing-DLL failures (0xC0000135) before the GUI hits them
+    # mid-pipeline with an empty stderr. Should always pass after Ensure-VCRedist.
+    Test-BinaryRunnable -Path (Join-Path $BinRoot "blastn.exe") -Name "blastn" -VersionArgs @("-version")
+    Test-BinaryRunnable -Path (Join-Path $BinRoot "primer3_core.exe") -Name "primer3_core" -VersionArgs @("-about")
+    Test-BinaryRunnable -Path (Join-Path $BinRoot "muscle.exe") -Name "muscle" -VersionArgs @("-version")
+
+    $env:SNP_PRIMER_HOME = $RuntimeRoot
+    $env:SNP_PRIMER_BINARY_ROOT = $BinRoot
+    $env:SNP_PRIMER_WORKDIR = $WorkspaceRoot
+    $KnownReference = Get-ChildItem -Path $ReferenceRoot -Recurse -Include *.fa,*.fasta,*.fna -File | Select-Object -First 1
+    if ($KnownReference) {
+        $env:SNP_PRIMER_REFERENCE_FASTA = $KnownReference.FullName
+    }
+
+    $Pythonw = Join-Path $VenvRoot "Scripts\pythonw.exe"
+    $PythonCli = Join-Path $VenvRoot "Scripts\python.exe"
+    Write-Status "Launching desktop app"
+    if (Test-Path -LiteralPath $Pythonw) {
+        $GuiProcess = Start-Process -FilePath $Pythonw -WorkingDirectory $AppRoot -ArgumentList @("-m", "snp_primer_app.launch_gui") -PassThru
+        Start-Sleep -Seconds 2
+        if ($GuiProcess.HasExited) {
+            throw "Desktop process exited immediately. See $RuntimeRoot\desktop_startup_error.log"
+        }
+    } else {
+        Invoke-Checked -FilePath $PythonCli -Arguments @("-m", "snp_primer_app.launch_gui") -Description "Launching desktop app"
+    }
+}
+catch {
+    Write-Host ""
+    Write-Host "Bootstrap failed. See log: $BootstrapLog" -ForegroundColor Red
+    throw
+}
+finally {
+    Stop-Transcript | Out-Null
+}

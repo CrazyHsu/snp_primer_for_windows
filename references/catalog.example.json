@@ -1,0 +1,25 @@
+{
+  "references": [
+    {
+      "id": "cs_v1",
+      "display_name": "Chinese Spring genome v1.0",
+      "ploidy_modes": ["ABD", "AB", "single"],
+      "fasta_url": "https://example.org/references/cs_v1/genome.fasta.gz",
+      "blast_db_url": "https://example.org/references/cs_v1/blastdb.zip",
+      "install_subdir": "cs_v1",
+      "size_bytes": 4200000000,
+      "sha256": "replace-with-real-checksum",
+      "enabled": true,
+      "notes": "Example manifest entry for on-demand installation."
+    },
+    {
+      "id": "cs_v2_1",
+      "display_name": "Chinese Spring genome v2.1",
+      "ploidy_modes": ["ABD", "AB", "single"],
+      "fasta_url": "https://example.org/references/cs_v2_1/genome.fasta.gz",
+      "blast_db_url": "https://example.org/references/cs_v2_1/blastdb.zip",
+      "install_subdir": "cs_v2_1",
+      "enabled": true
+    }
+  ]
+}

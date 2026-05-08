@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snp-primer-windows-app"
+version = "0.1.0"
+description = "Python 3 rewrite scaffold for a Windows-friendly SNP primer desktop app."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Codex" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+runtime = [
+  "primer3-py>=2.3,<3",
+]
+
+[project.scripts]
+snp-primer = "snp_primer_app.cli:main"
+snp-primer-desktop = "snp_primer_app.desktop:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"snp_primer_app.assets" = ["*.txt"]

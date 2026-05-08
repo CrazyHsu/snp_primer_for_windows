@@ -1,0 +1,39 @@
+# ─── Python 字节码与构建产物 ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── PyInstaller / build_windows.bat 输出 ───
+build/
+dist/
+*.spec
+
+# ─── 运行时产生的目录与日志 ───
+snp_primer_runtime/venv/
+snp_primer_runtime/workspace/
+snp_primer_runtime/workspace*/
+snp_primer_runtime/logs/
+snp_primer_runtime/tmp/
+snp_primer_runtime/downloads/
+snp_primer_runtime/bootstrap.log
+
+# ─── BLAST / primer3 / muscle 二进制 ───
+# bootstrap_and_launch.ps1 会自动下载，不入库
+snp_primer_runtime/bin/*.exe
+snp_primer_runtime/bin/*.dll
+
+# ─── WSL / Linux 残留（v7 已清空，预防再混进来）───
+tests/.linux_bin/
+tests/fixtures/_tmp/
+
+# ─── OS / 编辑器噪音 ───
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
