@@ -43,24 +43,47 @@ def _no_window_kwargs():
     return {}
 
 
-def _patched_call(*args, **kwargs):
-    """``subprocess.call`` 的 wrapper：Windows 上自动加 CREATE_NO_WINDOW。
+def _make_patched_call(bin_dir):
+    """生成 ``subprocess.call`` 的 wrapper，做两件事：
+
+    1. Windows 上自动加 ``creationflags=CREATE_NO_WINDOW``，子进程不弹黑框
+    2. 把 ``bin_dir`` 前置到 ``PATH``。这是 getkasp3.primer_blast / getCAPS 类似
+       函数的关键——它们 build 命令时用的是裸 ``blastn`` (line 263 of getkasp3.py)
+       而不是完整 .exe 路径，依赖 shell 能从 PATH 找到。Windows 上
+       ``snp_primer_runtime\\bin\\`` 不在系统 PATH，必须显式注入，否则 shell
+       找不到 blastn → 产物文件不生成 → ``open(outfile_blast)`` 抛 FileNotFoundError。
 
     getCAPS.py / getkasp3.py 是上游 commit 的 byte-for-byte 移植，不能改源码。
     它们顶部 ``from subprocess import call`` 把名字绑死了；这里在 import 之后把
     它们模块属性的 ``call`` 重新指向本 wrapper，所有后续 ``call(...)`` 调用都会
     走这条路径。
     """
-    if sys.platform == "win32" and "creationflags" not in kwargs:
-        kwargs["creationflags"] = _CREATE_NO_WINDOW
-    return subprocess.call(*args, **kwargs)
+    def _patched(*args, **kwargs):
+        if sys.platform == "win32" and "creationflags" not in kwargs:
+            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        if bin_dir and "env" not in kwargs:
+            env = os.environ.copy()
+            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+            kwargs["env"] = env
+        return subprocess.call(*args, **kwargs)
+    return _patched
 
 
 # 在 pipeline 模块 import 时一次性 patch；后续 import 顺序变了也无所谓，因为
 # 只有 pipeline.run() 会触发 getCAPS.caps_main / getkasp3.kasp_main，而进入
-# pipeline 之前这里已经执行过了。
+# pipeline 之前这里已经执行过了。bin_dir 暂时为 None；run() 会用真正的 bin_dir
+# 重新 patch 一次（见 _install_call_patch_with_bin_dir）。
+_patched_call = _make_patched_call(None)
 getCAPS.call = _patched_call
 getkasp3.call = _patched_call
+
+
+def _install_call_patch_with_bin_dir(bin_dir):
+    """run() 解析出 bin_dir 后调一次：把 getCAPS / getkasp3 的 call 重绑成带
+    PATH 注入的 wrapper。"""
+    patched = _make_patched_call(bin_dir)
+    getCAPS.call = patched
+    getkasp3.call = patched
 
 
 def _try_short_path_win(p):
@@ -341,6 +364,9 @@ def run(*,
         raise ValueError("必须提供 input_csv 或 flanking_files 至少一个")
 
     bin_dir_str = str(Path(bin_dir).resolve()) if bin_dir else None
+    # 把 bin_dir 注入到 getCAPS / getkasp3 那条 subprocess.call 链路的 PATH 上，
+    # 它们 build 命令时用裸 ``blastn`` 而不是完整 .exe 路径（getkasp3.py:263）。
+    _install_call_patch_with_bin_dir(bin_dir_str)
     # reference_fasta vs reference_db 二选一；同时给说明上层逻辑乱了。
     if reference_fasta and reference_db:
         raise ValueError(
