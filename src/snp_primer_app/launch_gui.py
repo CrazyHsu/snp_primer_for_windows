@@ -20,7 +20,12 @@ def _error_log_path() -> Path:
 
 def main() -> None:  # pragma: no cover - wrapper entry point
     try:
-        from .desktop import main as desktop_main
+        # 用绝对 import，而不是 ``from .desktop import``：PyInstaller 打包后把本
+        # 文件当 ``__main__`` 直接执行，``__package__`` 为空，相对 import 会抛
+        # ``ImportError: attempted relative import with no known parent package``。
+        # 绝对 import 在 ``python -m snp_primer_app.launch_gui`` 与 PyInstaller
+        # bundle 两种场景下都成立。
+        from snp_primer_app.desktop import main as desktop_main
 
         desktop_main()
     except Exception:
