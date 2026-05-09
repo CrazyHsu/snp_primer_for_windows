@@ -25,13 +25,25 @@ def app_home() -> Path:
 def _default_bin(home_root: Path) -> Path:
     """决定 bin 目录默认值。
 
-    PyInstaller 模式下，binaries 由 ``--add-binary <src>;bin`` 打进 bundle，
-    解压后落在 ``sys._MEIPASS/bin/``（--onefile 临时目录 / --onedir 的
-    ``_internal/bin/``）。若该目录存在 → 用它，省去用户再装一遍 BLAST+/primer3/
-    muscle 的麻烦。dev 模式（非 frozen）→ 走老路径
-    ``snp_primer_runtime/bin/``，由 bootstrap 管理。
+    PyInstaller frozen 模式下优先级：
+
+    1. ``<sys.executable 父目录>/bin/`` —— ``build_windows.bat`` 把
+       NCBI BLAST+ / primer3 / muscle .exe 与配套 DLL **直接拷在 .exe 旁边**，
+       与 PyInstaller 的 ``_internal/`` 完全隔离。这个目录是首选，因为
+       ``_internal/`` 里有 Python 自己带的 ``MSVCP140.dll`` /
+       ``VCRUNTIME140.dll`` / ``api-ms-win-*.dll``，跟 NCBI 编译时绑的版本经常
+       不兼容，混在一起 makeblastdb 会撞 0xC0000005。
+    2. ``sys._MEIPASS/bin/`` —— 兼容老一版 ``--add-binary`` 走法（当前
+       build_windows.bat 不再用，但保留 fallback 防止 someone 重写）。
+    3. dev 模式：``snp_primer_runtime/bin/``，由 bootstrap 管理。
     """
     if getattr(sys, "frozen", False):
+        try:
+            exe_dir_bin = Path(sys.executable).resolve().parent / "bin"
+            if exe_dir_bin.is_dir():
+                return exe_dir_bin
+        except OSError:
+            pass
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             bundled_bin = Path(meipass) / "bin"

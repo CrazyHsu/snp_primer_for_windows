@@ -50,9 +50,14 @@ REM   --windowed              : no console window for the .exe
 REM   --paths src --paths .   : let PyInstaller find both src/ and core/
 REM   --add-data              : ship core/assets (NEB / global_settings /
 REM                             primer3_config) + references catalog
-REM   --add-binary ...;bin    : land each .exe / .dll under <bundle>/bin
-REM                             so runtime_paths._default_bin (frozen mode)
-REM                             auto-points binary_root_var there
+REM   NOTE: we do NOT --add-binary the BLAST/primer3/muscle .exe / .dll.
+REM   PyInstaller's binary dep analyzer scatters Python's MSVCP140 /
+REM   VCRUNTIME140 / api-ms-win-* into _internal/, and when subprocess
+REM   launches NCBI .exe with PATH inheriting _internal/, those wrong-
+REM   version DLLs shadow what NCBI was built against -> rc=0xC0000005
+REM   (access violation, no stderr). Instead we COPY the bin tree to a
+REM   sibling folder of _internal/ in Step 6, completely outside the
+REM   PyInstaller bundle.
 REM   --collect-submodules    : pull all snp_primer_app + core submodules
 echo [BUILD] running PyInstaller...
 pyinstaller --noconfirm --clean ^
@@ -62,16 +67,19 @@ pyinstaller --noconfirm --clean ^
   --paths "%ROOT%" ^
   --add-data "%ROOT%\core\assets;core\assets" ^
   --add-data "%ROOT%\references\catalog.example.json;references" ^
-  --add-binary "%BIN%\blastn.exe;bin" ^
-  --add-binary "%BIN%\blastdbcmd.exe;bin" ^
-  --add-binary "%BIN%\makeblastdb.exe;bin" ^
-  --add-binary "%BIN%\primer3_core.exe;bin" ^
-  --add-binary "%BIN%\muscle.exe;bin" ^
-  --add-binary "%BIN%\nghttp2.dll;bin" ^
-  --add-binary "%BIN%\ncbi-vdb-md.dll;bin" ^
   --collect-submodules snp_primer_app ^
   --collect-submodules core ^
   "%ROOT%\src\snp_primer_app\launch_gui.py"
+if errorlevel 1 goto :err
+
+REM --- Step 5b: copy NCBI binaries to dist\SNPPrimerDesktop\bin\ ---
+REM This puts blastn / blastdbcmd / makeblastdb / primer3_core / muscle
+REM + their DLLs in a CLEAN sibling folder of _internal/, so when
+REM subprocess launches them, Windows DLL search finds nghttp2.dll /
+REM ncbi-vdb-md.dll alongside the .exe (correct behavior) WITHOUT
+REM contention from Python's bundled VC runtime in _internal/.
+echo [BUILD] copying NCBI binaries to dist\SNPPrimerDesktop\bin\ ...
+xcopy /E /I /Y /Q "%BIN%" "%ROOT%\dist\SNPPrimerDesktop\bin\" >nul
 if errorlevel 1 goto :err
 
 REM --- Step 6: success summary ---------------------------------

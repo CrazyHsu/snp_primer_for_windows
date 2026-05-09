@@ -37,14 +37,57 @@ ASSETS_DIR = HERE / "assets"
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
+def _frozen_polluted_dirs():
+    """PyInstaller frozen 模式下，``_MEIPASS`` 和 ``sys.executable`` 父目录会被
+    自动加进父进程的 PATH（用于 PyInstaller 自己 load Python DLL）。子进程继承
+    PATH 之后，NCBI 的 .exe（makeblastdb / blastn / blastdbcmd）会从 ``_internal/``
+    错误地加载 Python 自带的 ``MSVCP140.dll`` / ``VCRUNTIME140.dll`` /
+    ``api-ms-win-*.dll``，这些跟 NCBI 编译时绑的版本不一定兼容，结果就是
+    rc=0xC0000005（access violation）然后无 stderr 输出。
+
+    返回这些"被污染"目录的 normpath 集合，调用方在子进程 env 里把它们从 PATH
+    剔掉就行。dev 模式 / 非 Windows 永远返回空集合，零开销。
+    """
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return set()
+    polluted = set()
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        polluted.add(os.path.normcase(os.path.normpath(meipass)))
+    try:
+        exe_dir = str(Path(sys.executable).resolve().parent)
+        polluted.add(os.path.normcase(os.path.normpath(exe_dir)))
+    except OSError:
+        pass
+    return polluted
+
+
+def _scrub_path(path_value, polluted):
+    if not polluted:
+        return path_value
+    parts = path_value.split(os.pathsep) if path_value else []
+    kept = [p for p in parts
+            if p and os.path.normcase(os.path.normpath(p)) not in polluted]
+    return os.pathsep.join(kept)
+
+
 def _no_window_kwargs():
+    """构造 subprocess kwargs：Windows 不弹黑框 + frozen 模式下从 PATH 摘掉
+    PyInstaller 注入的 ``_internal/`` / ``_MEIPASS``，避免 NCBI .exe 加载错版本
+    的 VC runtime / api-ms-win-* 而崩成 0xC0000005。"""
+    kw = {}
     if sys.platform == "win32":
-        return {"creationflags": _CREATE_NO_WINDOW}
-    return {}
+        kw["creationflags"] = _CREATE_NO_WINDOW
+        polluted = _frozen_polluted_dirs()
+        if polluted:
+            env = os.environ.copy()
+            env["PATH"] = _scrub_path(env.get("PATH", ""), polluted)
+            kw["env"] = env
+    return kw
 
 
 def _make_patched_call(bin_dir):
-    """生成 ``subprocess.call`` 的 wrapper，做两件事：
+    """生成 ``subprocess.call`` 的 wrapper，做三件事：
 
     1. Windows 上自动加 ``creationflags=CREATE_NO_WINDOW``，子进程不弹黑框
     2. 把 ``bin_dir`` 前置到 ``PATH``。这是 getkasp3.primer_blast / getCAPS 类似
@@ -52,6 +95,8 @@ def _make_patched_call(bin_dir):
        而不是完整 .exe 路径，依赖 shell 能从 PATH 找到。Windows 上
        ``snp_primer_runtime\\bin\\`` 不在系统 PATH，必须显式注入，否则 shell
        找不到 blastn → 产物文件不生成 → ``open(outfile_blast)`` 抛 FileNotFoundError。
+    3. PyInstaller frozen 模式下从继承 PATH 里剔掉 ``_internal/`` / ``_MEIPASS``，
+       理由同 ``_no_window_kwargs``。
 
     getCAPS.py / getkasp3.py 是上游 commit 的 byte-for-byte 移植，不能改源码。
     它们顶部 ``from subprocess import call`` 把名字绑死了；这里在 import 之后把
@@ -61,9 +106,13 @@ def _make_patched_call(bin_dir):
     def _patched(*args, **kwargs):
         if sys.platform == "win32" and "creationflags" not in kwargs:
             kwargs["creationflags"] = _CREATE_NO_WINDOW
-        if bin_dir and "env" not in kwargs:
+        if "env" not in kwargs and (bin_dir or sys.platform == "win32"):
             env = os.environ.copy()
-            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+            polluted = _frozen_polluted_dirs()
+            if polluted:
+                env["PATH"] = _scrub_path(env.get("PATH", ""), polluted)
+            if bin_dir:
+                env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
             kwargs["env"] = env
         return subprocess.call(*args, **kwargs)
     return _patched
