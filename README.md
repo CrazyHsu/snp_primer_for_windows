@@ -59,16 +59,25 @@ tests/                     单元测试 + fixtures（dev 用）
 
 ## 打包成独立 .exe（可选）
 
-如果要分发给完全没装 Python 的用户，可以用 PyInstaller 打成单体可执行：
+如果要分发给完全没装 Python 的用户，可以用 PyInstaller 打成可执行。先**跑一次
+bootstrap** 让 `snp_primer_runtime\venv\` 与 `snp_primer_runtime\bin\*.exe` 就位
+（双击 `windows\Launch SNP Primer Desktop.cmd`），然后两条路径任选其一：
 
-1. 先双击 `windows\Launch SNP Primer Desktop.cmd` 跑一次 bootstrap（让
-   `snp_primer_runtime\venv\` 与 `snp_primer_runtime\bin\*.exe` 就位）
-2. 双击 `build_windows.bat`
-3. 输出在 `dist\SNPPrimerDesktop\SNPPrimerDesktop.exe`，整个文件夹拷给用户即可
+| | `build_windows.bat`（onedir） | `build_windows_onefile.bat`（onefile） |
+|---|---|---|
+| 输出 | `dist\SNPPrimerDesktop\` 文件夹（带 `_internal\` + `bin\`） | 单一个 `dist\SNPPrimerDesktop.exe` |
+| 启动速度 | 几乎瞬开 | 每次 5-15s 解压临时目录 |
+| 杀软误报 | 较低 | 较高（PyInstaller `--onefile` bootloader 常被误判） |
+| 调试 | 文件结构看得见 | 临时解压在 `%TEMP%\_MEIxxxxxx\`，过会清掉 |
+| Workspace 落点 | `dist\SNPPrimerDesktop\snp_primer_runtime\` | **从哪个目录双击就在哪** |
+| 分发 | 整个文件夹拷给用户 | 单 .exe 拷给用户 |
 
-产物里 BLAST+/primer3/muscle 二进制 + 算法 assets 都已打进去；终端用户机器
-上不用再装 Python，双击就跑。workspace / logs 落在 .exe 旁边的
-`snp_primer_runtime\` 下。
+两种产物里 BLAST+/primer3/muscle 二进制 + 算法 assets 都已打进去，终端用户机器
+上不用装 Python。**默认推荐 onedir**（启动快、易排错）；只有需要"只发一个 .exe"
+的场景才走 onefile。
+
+> 单 .exe 用户提醒：建议给 .exe 单独放一个文件夹（如 `Desktop\SNPPrimer\`），
+> 否则 workspace / logs 会建在 .exe 所在的目录里，污染下载 / 桌面。
 
 ## 系统需求
 
