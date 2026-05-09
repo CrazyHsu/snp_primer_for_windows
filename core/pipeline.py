@@ -564,6 +564,17 @@ def run(*,
         if design_kasp:
             _cat_files(sorted(glob("KASP_output/selected_KASP_primers*")),
                        "Potential_KASP_primers.tsv")
+            # Post-process：给 KASP 输出表末尾追加 target_chromosome 列。
+            # getkasp3.py 是 byte-for-byte 上游移植不能动；这里是后置增强，
+            # 不动 index / 前 16 列，所以 compare_outputs.py 严格比较仍 byte-for-byte
+            # 通过 wheatomics。flanking_files fixture 模式没有 polymarker_input.csv，
+            # 这一步会 silently skip。
+            marker_to_chrom = _read_marker_to_chrom("polymarker_input.csv")
+            if marker_to_chrom:
+                _add_target_chromosome_column("Potential_KASP_primers.tsv",
+                                              marker_to_chrom)
+                for sf in glob("KASP_output/selected_KASP_primers_*.txt"):
+                    _add_target_chromosome_column(sf, marker_to_chrom)
         # All_alignment_raw.fa：和上游一致，每个文件加文件名头
         align_files = sorted(glob("alignment_raw_*"))
         with open("All_alignment_raw.fa", "w", encoding="utf-8") as out:
@@ -618,6 +629,67 @@ def _split_temp_range(path):
         with open("temp_marker_" + query + ".txt", "w", encoding="utf-8") as out:
             for ln in lines:
                 out.write(ln + "\n")
+
+
+def _read_marker_to_chrom(polymarker_csv_path):
+    """从 polymarker_input.csv 读 ``marker→chromosome`` 映射。
+
+    输入行格式：``IWB50236,7A,cctcc...[A/G]CTTGG...``
+    返回 ``{"IWB50236": "7A", ...}``。
+    """
+    mapping = {}
+    p = Path(polymarker_csv_path)
+    if not p.is_file():
+        return mapping
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(",", 2)
+            if len(parts) >= 2 and parts[0]:
+                mapping[parts[0]] = parts[1]
+    return mapping
+
+
+def _add_target_chromosome_column(tsv_path, marker_to_chrom):
+    """给 KASP 输出文件末尾追加 ``target_chromosome`` 列。
+
+    覆盖：``Potential_KASP_primers.tsv`` 与
+    ``KASP_output/selected_KASP_primers_<MARKER>.txt``。
+
+    安全性：
+    - 如果 header 行已经包含 ``target_chromosome`` 列（重跑场景）→ 直接 skip，
+      不重复追加
+    - 数据行：从 ``index`` 列首段（marker name，例如 ``IWB50236-right-0-A`` →
+      ``IWB50236``）查 chromosome；查不到留空
+    - 非数据行（空行 / "Sites that can differ all" 这种 footer）原样透传
+    """
+    p = Path(tsv_path)
+    if not p.is_file():
+        return
+    with open(p, "r", encoding="utf-8") as f:
+        original = f.readlines()
+    # 已经处理过就跳过，幂等
+    for line in original:
+        if line.startswith("index\t") and "target_chromosome" in line:
+            return
+    new_lines = []
+    for line in original:
+        stripped = line.rstrip("\n")
+        if not stripped:
+            new_lines.append(line)
+            continue
+        if stripped.startswith("index\t"):
+            new_lines.append(stripped + "\ttarget_chromosome\n")
+            continue
+        fields = stripped.split("\t")
+        if len(fields) >= 2 and fields[0] and "-" in fields[0]:
+            # 形如 IWB50236-right-0-A
+            marker = fields[0].split("-")[0]
+            chrom = marker_to_chrom.get(marker, "")
+            new_lines.append(stripped + "\t" + chrom + "\n")
+        else:
+            new_lines.append(line)
+    with open(p, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
 
 
 def _cat_files(files, dest):

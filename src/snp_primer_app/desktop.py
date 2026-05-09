@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from .models import BinaryBundle, PipelineRequest
 from .parsers import parse_polymarker_lines, render_blast_fasta
 from .pipeline_runner import PipelineRunner
+from .primer_blast_view import collect_kasp_blast_groups, render_alignment
 from .runtime_paths import default_reference_fasta, ensure_runtime_dirs
 from .workflow import build_pipeline_plan
 
@@ -59,6 +60,10 @@ class DesktopApp:
             foreground=[("selected", "#1a73e8"),
                         ("!selected", "#444444")],
         )
+        # 给 KASP Primer BLAST 子 tab 用的左侧竖排样式
+        _style.configure("VerticalKaspBlast.TNotebook", tabposition="wn")
+        _style.configure("VerticalKaspBlast.TNotebook.Tab",
+                         padding=[14, 8], font=("Segoe UI", 10))
         self._mono_font = ("Consolas", 12)
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.run_thread: threading.Thread | None = None
@@ -247,6 +252,12 @@ class DesktopApp:
         self.fasta_text = self._add_tab("FASTA Preview")
         self.kasp_text = self._add_tab("KASP")
         self.caps_text = self._add_tab("CAPS")
+        # 新 tab：每条 KASP primer 的 BLAST 比对视图（左侧竖排子 tab）。
+        # 创建 outer Frame，run 之前 placeholder；_handle_run_complete 后用真实
+        # 数据 _populate_kasp_primer_blast_tab() 重新填。
+        self.kasp_blast_outer = ttk.Frame(self.notebook)
+        self.notebook.add(self.kasp_blast_outer, text="KASP Primer BLAST")
+        self._render_kasp_blast_placeholder()
         self.summary_text = self._add_tab("Summary")
 
     def _add_tab(self, title: str) -> tk.Text:
@@ -548,6 +559,7 @@ class DesktopApp:
         if result.potential_caps and result.potential_caps.exists():
             self.caps_text.delete("1.0", tk.END)
             self.caps_text.insert("1.0", result.potential_caps.read_text(encoding="utf-8"))
+        self._populate_kasp_primer_blast_tab(result)
         self.notebook.select(self.summary_text.master)
         self.log("Pipeline completed")
 
@@ -556,6 +568,63 @@ class DesktopApp:
         self.log(message)
         full = f"{message}\n\n完整日志见: {self._log_path}"
         messagebox.showerror("Pipeline Failed", full)
+
+    def _render_kasp_blast_placeholder(self) -> None:
+        """KASP Primer BLAST tab 默认 placeholder（pipeline 还没跑 / 没勾 Blast primers
+        / 没设计 KASP 时显示）。"""
+        for child in self.kasp_blast_outer.winfo_children():
+            child.destroy()
+        msg = ("Run pipeline with both 'Design KASP' and 'Blast primers' checked\n"
+               "to populate this view.\n\n"
+               "Each KASP primer will get a sub-tab on the left showing its BLAST\n"
+               "alignment against the reference (query / midline / subject).")
+        lbl = tk.Label(self.kasp_blast_outer, text=msg, justify=tk.LEFT,
+                       padx=20, pady=20, font=("Segoe UI", 11), fg="#555555")
+        lbl.pack(fill=tk.BOTH, expand=True)
+
+    def _populate_kasp_primer_blast_tab(self, result) -> None:
+        """跑完 pipeline 后用真实数据填 KASP Primer BLAST tab。"""
+        for child in self.kasp_blast_outer.winfo_children():
+            child.destroy()
+
+        kasp_dir = getattr(result, "working_dir", None)
+        kasp_dir = (kasp_dir / "KASP_output") if kasp_dir else None
+        if not kasp_dir or not kasp_dir.is_dir():
+            self._render_kasp_blast_placeholder()
+            return
+
+        groups = collect_kasp_blast_groups(kasp_dir)
+        # 没生成 primer_blast_out_*.txt（没勾 Blast primers）→ placeholder
+        if not groups:
+            self._render_kasp_blast_placeholder()
+            return
+
+        inner = ttk.Notebook(self.kasp_blast_outer,
+                             style="VerticalKaspBlast.TNotebook")
+        inner.pack(fill=tk.BOTH, expand=True)
+        # 每个 marker 的每条 unique primer 一个 sub-tab
+        any_added = False
+        for marker, by_primer in groups.items():
+            for primer_id, hits in by_primer.items():
+                tab_frame = ttk.Frame(inner)
+                inner.add(tab_frame, text=f"{marker}_{primer_id}")
+                txt = tk.Text(tab_frame, wrap=tk.NONE, font=self._mono_font)
+                yscroll = ttk.Scrollbar(tab_frame, orient=tk.VERTICAL,
+                                        command=txt.yview)
+                xscroll = ttk.Scrollbar(tab_frame, orient=tk.HORIZONTAL,
+                                        command=txt.xview)
+                txt.configure(yscrollcommand=yscroll.set,
+                              xscrollcommand=xscroll.set)
+                yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+                xscroll.pack(side=tk.BOTTOM, fill=tk.X)
+                txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                rendered = render_alignment(f"{marker}_{primer_id}", None, hits)
+                txt.insert("1.0", rendered)
+                txt.configure(state="disabled")
+                any_added = True
+
+        if not any_added:
+            self._render_kasp_blast_placeholder()
 
 
 def main() -> None:  # pragma: no cover - UI entry point
