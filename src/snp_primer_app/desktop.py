@@ -583,7 +583,13 @@ class DesktopApp:
         lbl.pack(fill=tk.BOTH, expand=True)
 
     def _populate_kasp_primer_blast_tab(self, result) -> None:
-        """跑完 pipeline 后用真实数据填 KASP Primer BLAST tab。"""
+        """跑完 pipeline 后用真实数据填 KASP Primer BLAST tab。
+
+        UI：PanedWindow 左右分隔。左侧 Listbox + 竖向 Scrollbar，列出
+        ``<marker>_<primer_id>`` 条目；右侧 Text 显示选中条目的比对。
+        ttk.Notebook 的 vertical tab 不支持滚动，primer 多了就被截断；
+        这里换成 Listbox 是为了拿到天然的滚轮 + 滚动条。
+        """
         for child in self.kasp_blast_outer.winfo_children():
             child.destroy()
 
@@ -599,32 +605,65 @@ class DesktopApp:
             self._render_kasp_blast_placeholder()
             return
 
-        inner = ttk.Notebook(self.kasp_blast_outer,
-                             style="VerticalKaspBlast.TNotebook")
-        inner.pack(fill=tk.BOTH, expand=True)
-        # 每个 marker 的每条 unique primer 一个 sub-tab
-        any_added = False
+        # 渲染好每条 primer 的文本，按显示顺序存进 ordered list
+        items: list[str] = []
+        rendered_by_label: dict[str, str] = {}
         for marker, by_primer in groups.items():
             for primer_id, hits in by_primer.items():
-                tab_frame = ttk.Frame(inner)
-                inner.add(tab_frame, text=f"{marker}_{primer_id}")
-                txt = tk.Text(tab_frame, wrap=tk.NONE, font=self._mono_font)
-                yscroll = ttk.Scrollbar(tab_frame, orient=tk.VERTICAL,
-                                        command=txt.yview)
-                xscroll = ttk.Scrollbar(tab_frame, orient=tk.HORIZONTAL,
-                                        command=txt.xview)
-                txt.configure(yscrollcommand=yscroll.set,
-                              xscrollcommand=xscroll.set)
-                yscroll.pack(side=tk.RIGHT, fill=tk.Y)
-                xscroll.pack(side=tk.BOTTOM, fill=tk.X)
-                txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-                rendered = render_alignment(f"{marker}_{primer_id}", None, hits)
-                txt.insert("1.0", rendered)
-                txt.configure(state="disabled")
-                any_added = True
+                label = f"{marker}_{primer_id}"
+                items.append(label)
+                rendered_by_label[label] = render_alignment(label, None, hits)
 
-        if not any_added:
+        if not items:
             self._render_kasp_blast_placeholder()
+            return
+
+        paned = ttk.PanedWindow(self.kasp_blast_outer, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # 左侧：Listbox + 竖向 Scrollbar
+        left = ttk.Frame(paned)
+        list_yscroll = ttk.Scrollbar(left, orient=tk.VERTICAL)
+        listbox = tk.Listbox(left, font=("Segoe UI", 11),
+                             yscrollcommand=list_yscroll.set,
+                             exportselection=False, activestyle="dotbox",
+                             width=24)
+        list_yscroll.configure(command=listbox.yview)
+        list_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for label in items:
+            listbox.insert(tk.END, label)
+        paned.add(left, weight=1)
+
+        # 右侧：Text + 双向 Scrollbar
+        right = ttk.Frame(paned)
+        txt_yscroll = ttk.Scrollbar(right, orient=tk.VERTICAL)
+        txt_xscroll = ttk.Scrollbar(right, orient=tk.HORIZONTAL)
+        txt = tk.Text(right, wrap=tk.NONE, font=self._mono_font,
+                      yscrollcommand=txt_yscroll.set,
+                      xscrollcommand=txt_xscroll.set)
+        txt_yscroll.configure(command=txt.yview)
+        txt_xscroll.configure(command=txt.xview)
+        txt_yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        txt_xscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        paned.add(right, weight=4)
+
+        def _on_select(_event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            label = listbox.get(sel[0])
+            txt.configure(state="normal")
+            txt.delete("1.0", tk.END)
+            txt.insert("1.0", rendered_by_label.get(label, ""))
+            txt.configure(state="disabled")
+
+        listbox.bind("<<ListboxSelect>>", _on_select)
+        # 默认选中第一条，让用户进 tab 立刻看到内容
+        listbox.select_set(0)
+        listbox.activate(0)
+        _on_select()
 
 
 def main() -> None:  # pragma: no cover - UI entry point
