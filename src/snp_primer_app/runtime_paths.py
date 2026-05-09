@@ -22,17 +22,40 @@ def app_home() -> Path:
     return package_root() / "snp_primer_runtime"
 
 
+def _default_bin(home_root: Path) -> Path:
+    """决定 bin 目录默认值。
+
+    PyInstaller 模式下，binaries 由 ``--add-binary <src>;bin`` 打进 bundle，
+    解压后落在 ``sys._MEIPASS/bin/``（--onefile 临时目录 / --onedir 的
+    ``_internal/bin/``）。若该目录存在 → 用它，省去用户再装一遍 BLAST+/primer3/
+    muscle 的麻烦。dev 模式（非 frozen）→ 走老路径
+    ``snp_primer_runtime/bin/``，由 bootstrap 管理。
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bundled_bin = Path(meipass) / "bin"
+            if bundled_bin.is_dir():
+                return bundled_bin
+    return home_root / "bin"
+
+
 def ensure_runtime_dirs() -> dict[str, Path]:
     root = app_home()
     paths = {
         "home": root,
-        "bin": Path(os.environ.get("SNP_PRIMER_BINARY_ROOT", root / "bin")),
+        "bin": Path(os.environ.get("SNP_PRIMER_BINARY_ROOT", _default_bin(root))),
         "workspace": Path(os.environ.get("SNP_PRIMER_WORKDIR", root / "workspace")),
         "references": root / "references",
         "logs": root / "logs",
     }
+    # mkdir 用 try：bin 在 frozen+bundled 时指向 _MEIPASS（已存在；mkdir 幂等
+    # 不会失败）；非 frozen / 用户自定义路径 mkdir 失败也别让 GUI 起不来。
     for key in ("home", "bin", "workspace", "references", "logs"):
-        paths[key].mkdir(parents=True, exist_ok=True)
+        try:
+            paths[key].mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError):
+            pass
     return paths
 
 

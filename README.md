@@ -57,6 +57,19 @@ references/                参考序列示例配置
 tests/                     单元测试 + fixtures（dev 用）
 ```
 
+## 打包成独立 .exe（可选）
+
+如果要分发给完全没装 Python 的用户，可以用 PyInstaller 打成单体可执行：
+
+1. 先双击 `windows\Launch SNP Primer Desktop.cmd` 跑一次 bootstrap（让
+   `snp_primer_runtime\venv\` 与 `snp_primer_runtime\bin\*.exe` 就位）
+2. 双击 `build_windows.bat`
+3. 输出在 `dist\SNPPrimerDesktop\SNPPrimerDesktop.exe`，整个文件夹拷给用户即可
+
+产物里 BLAST+/primer3/muscle 二进制 + 算法 assets 都已打进去；终端用户机器
+上不用再装 Python，双击就跑。workspace / logs 落在 .exe 旁边的
+`snp_primer_runtime\` 下。
+
 ## 系统需求
 
 - Windows 10 / 11 (x64)
