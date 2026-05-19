@@ -88,6 +88,37 @@ bootloader 的 SxS activation context 通过 `CreateProcess` 继承到 NCBI .exe
 > 它们复制到 `dist\bin\`。这不是纯单文件分发，但能避开 `makeblastdb`
 > `0xC0000005` 这类 Windows/PyInstaller 子进程问题。
 
+## 故障排查
+
+**双击 cmd 后窗口一闪而过 / 反复报 `Python installer failed with exit code 1392`**
+
+第一次启动时下载 Python installer 被网络层中断（杀软 HTTPS 拦截、公司代理、网络抖动都可能），
+残留了半成品文件。删了再重试：
+```
+del "%cd%\snp_primer_runtime\downloads\python-3.11.9-amd64.exe"
+```
+然后再次双击 `Launch SNP Primer Desktop.cmd`。如果网络仍持续被掐，先关本机杀软的
+HTTPS 拦截 / 换网络，或在系统上手动装 Python 3.11+——bootstrap 会自动检测系统 Python
+并跳过下载。
+
+**`bootstrap.log` 里看到 `Download failed: ...`**
+
+`Invoke-Download` 已经把 partial 文件清掉了，重试一次即可。如果反复同 URL 失败，
+那就是网络层问题，参照上一条处理。
+
+**onefile 版本（`SNPPrimerDesktop.exe` 单文件）跑 `makeblastdb` 报 `0xC0000005`**
+
+PyInstaller `--onefile` 的 SxS activation context 在某些 Windows 机器上会让 NCBI 二进制
+加载到错配的 VC runtime。换 `build_windows.bat` 出的 onedir 产物（`dist\SNPPrimerDesktop\`
+文件夹）就行——这是默认推荐路径。
+
+**GUI 跑流程时报"Pipeline Failed"但 messagebox 信息看不全**
+
+打开 `snp_primer_runtime\logs\desktop_<时间戳>.log`，里面有完整的 subprocess stdout +
+stderr。messagebox 末尾也会附该路径。90% 的"blastn 失败"是 BLAST DB prefix 写错
+（如填了 `Chr7A` 但实际文件叫 `Chr7A.fasta.nhr`，应填 `Chr7A.fasta`）或 DB 没用
+`-parse_seqids` 建过。
+
 ## 系统需求
 
 - Windows 10 / 11 (x64)

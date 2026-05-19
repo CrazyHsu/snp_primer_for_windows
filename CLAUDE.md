@@ -1,8 +1,20 @@
-# CLAUDE.md — SNP Primer Windows App v7（ChatGPT 系列）
+# CLAUDE.md — SNP Primer Windows App v9（ChatGPT 系列）
 
-> 这份文件给未来的 Claude 会话用：你（Claude）会在 v7 目录里被启动协助迭代时，
+> 这份文件给未来的 Claude 会话用：你（Claude）会在 v9 目录里被启动协助迭代时，
 > **先读这份文件**再动手。它只列那些**从代码里读不出来 / 容易踩坑 / 一旦忘记就出错**
 > 的事。常规的目录布局、函数签名、依赖版本去 README.md 和代码里查。
+
+> **v9 = v8 的干净副本 + bootstrap 下载加固**（2026-05-15）：
+> - 加固 `windows/bootstrap_and_launch.ps1` 的 `Invoke-Download`：写入
+>   `.partial` 临时文件、失败时清理、`-MinBytes` 大小校验；详见 §6.10。
+> - `Ensure-LocalPython` installer 跑失败时主动删 installer，防止下次重试又拿到
+>   坏文件死循环（1392 ERROR_FILE_CORRUPT）。
+> - 其它逻辑/算法层与 v8 完全等同。
+
+> **v8 vs v7 差异**（2026-05-13）：v8 新增 `windows/bin/` 预打包二进制目录，bootstrap
+> 跑 `Copy-BundledBinaries` 时优先从这里 copy，避免每次 bootstrap 都重新下载 BLAST+
+> tar 等大文件。v8 也加入了 `build_windows.bat` / `build_windows_onefile.bat` 两套
+> PyInstaller 打包入口（v7 引入，v8 调整）。
 
 > **v7 = v6 的干净副本**（2026-05-08）：代码与 v6 等价，但已剔除运行时与 WSL 残留：
 > - 删 `snp_primer_runtime/{venv,workspace*,logs,tmp,downloads,bootstrap.log}`
@@ -268,6 +280,43 @@ copy `bin/*.exe + bin/*.dll` 全量。
 所以才做"迷你 ABD BLAST 库"——从标准 `alignment_raw_*.fa` 提取 7A/7D/4A 同源段、
 500N padding、100kb N spacer 拼一条染色体大小的合成 contig。详见
 `tests/build_mini_abd_db.py`。**MSA 序列要剥掉 `-` 字符再入库**，否则 BLAST 命中坐标偏移。
+
+### 6.10 网络中断 → partial download → installer 1392 死循环（v9 已修）
+
+**症状**（新电脑首次启动 v8 时观察到）：`bootstrap.log` 显示
+```
+[SNPPrimer] Installing local Python runtime
+PS>TerminatingError():"Python installer failed with exit code 1392"
+```
+反复重试（双击 launch cmd 多次）都死在同一行。1392 = `ERROR_FILE_CORRUPT`。
+
+**根因**：v8 及更早的 `Invoke-Download` 只检查文件存在与否：
+```powershell
+if (Test-Path -LiteralPath $OutFile) { return }   # 残破文件也不重下
+Invoke-WebRequest -Uri $Url -OutFile $OutFile
+```
+`Invoke-WebRequest` 失败时**已经在目标路径写出了部分文件**（PowerShell 流式写入，
+失败不自动清理）。第一次下载被掐（杀软 HTTPS MITM / 公司代理 reset）→ partial 文件
+留在 `snp_primer_runtime\downloads\python-3.11.9-amd64.exe` → 后续每次重启都跳过下载、
+把损坏的 installer 喂给 Start-Process → 1392 死循环。
+
+**v9 修复**（`windows/bootstrap_and_launch.ps1`）：
+1. `Invoke-Download` 下到 `$OutFile.partial`，全部下完才 `Move-Item` 到目标 → 任何
+   中间失败都不会污染下次重试。
+2. `try/catch` 包住 `Invoke-WebRequest`，catch 里删 `.partial`。
+3. 新参数 `-MinBytes`：下完后检查文件大小，太小（HTTP 没报错但内容被截断）也直接
+   清掉重抛。所有调用点都填了合理下限（python installer 20MB / BLAST tar 50MB /
+   muscle 1MB / primer3_core 50KB / vc_redist 10MB）。
+4. `Ensure-LocalPython` installer 跑失败时（任何 exit code 非 0）主动 `Remove-Item`
+   installer 文件，强制下次重新下载。
+
+**用户线上排查（万一 v9 仍碰到）**：
+- 删 `snp_primer_runtime\downloads\python-3.11.9-amd64.exe` 重试。
+- 如果网络持续被中断：关本机杀软 HTTPS 拦截 / 换网络，或在系统上手动装
+  Python 3.11+——bootstrap 的 `Get-ExistingPython` 会自动检测并跳过下载。
+
+未来再加新二进制下载时，**必须**走 `Invoke-Download` 且加 `-MinBytes`，
+不要直接调 `Invoke-WebRequest`。
 
 ---
 

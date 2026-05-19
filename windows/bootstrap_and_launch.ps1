@@ -36,15 +36,56 @@ function Ensure-Directory {
 }
 
 function Invoke-Download {
+    # Robust download with crash-safe semantics:
+    #  - Writes to a .partial sidecar; renames to OutFile only on full success.
+    #  - Any failure during download cleans the .partial up, so the next retry
+    #    re-downloads from scratch and does NOT reuse a corrupt cached file.
+    #  - Optional -MinBytes catches truncated downloads that did NOT raise an
+    #    HTTP error (antivirus / proxy mid-stream cuts).
+    # Guards against the Python-installer 1392 ERROR_FILE_CORRUPT loop. See
+    # CLAUDE.md section 6.10 for the bug history.
     param(
         [string]$Url,
-        [string]$OutFile
+        [string]$OutFile,
+        [int]$MinBytes = 0
     )
     if (Test-Path -LiteralPath $OutFile) {
-        return
+        if ($MinBytes -gt 0) {
+            $sz = (Get-Item -LiteralPath $OutFile).Length
+            if ($sz -lt $MinBytes) {
+                Write-Status "Cached $OutFile is $sz bytes (< $MinBytes expected); re-downloading"
+                Remove-Item -LiteralPath $OutFile -Force
+            } else {
+                return
+            }
+        } else {
+            return
+        }
     }
     Write-Status "Downloading $Url"
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile
+    $Partial = "$OutFile.partial"
+    if (Test-Path -LiteralPath $Partial) {
+        Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $Partial -UseBasicParsing
+    } catch {
+        if (Test-Path -LiteralPath $Partial) {
+            Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
+        }
+        throw ("Download failed: " + $Url + " -- " + $_.Exception.Message + `
+               ". If this is a network / antivirus problem, fix the network and re-run. " + `
+               "Or manually place the file at: " + $OutFile)
+    }
+    if ($MinBytes -gt 0) {
+        $sz = (Get-Item -LiteralPath $Partial).Length
+        if ($sz -lt $MinBytes) {
+            Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
+            throw ("Downloaded $Url is only $sz bytes (< $MinBytes expected). " + `
+                   "Connection was likely truncated by antivirus / proxy. Re-run to retry.")
+        }
+    }
+    Move-Item -LiteralPath $Partial -Destination $OutFile -Force
 }
 
 function Invoke-Checked {
@@ -106,7 +147,8 @@ function Ensure-LocalPython {
     Ensure-Directory (Split-Path -Parent $PythonRoot)
     Ensure-Directory $DownloadsRoot
     $Installer = Join-Path $DownloadsRoot "python-3.11.9-amd64.exe"
-    Invoke-Download -Url $PythonInstallerUrl -OutFile $Installer
+    # python-3.11.9-amd64.exe is ~26 MB; refuse anything under 20 MB as truncated
+    Invoke-Download -Url $PythonInstallerUrl -OutFile $Installer -MinBytes 20000000
     Write-Status "Installing local Python runtime"
     $InstallProcess = Start-Process -FilePath $Installer -ArgumentList @(
         "/passive",
@@ -128,7 +170,13 @@ function Ensure-LocalPython {
         "SimpleInstall=0"
     ) -Wait -PassThru
     if ($InstallProcess.ExitCode -ne 0) {
-        throw "Python installer failed with exit code $($InstallProcess.ExitCode)"
+        # Delete the installer so the next run re-downloads from scratch instead
+        # of looping on a possibly-corrupt cached file (exit code 1392 =
+        # ERROR_FILE_CORRUPT). The .partial guard in Invoke-Download should
+        # prevent this in practice, but this is a second line of defense.
+        Write-Status "Python installer exited $($InstallProcess.ExitCode); removing $Installer so next run re-downloads"
+        Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
+        throw "Python installer failed with exit code $($InstallProcess.ExitCode) (1392 = ERROR_FILE_CORRUPT; installer cleared so next run re-downloads)"
     }
     if (-not (Test-Path -LiteralPath $PythonExe)) {
         throw "Failed to install Python runtime into $PythonRoot"
@@ -174,7 +222,8 @@ function Ensure-BlastTools {
     Ensure-Directory $TempRoot
     $TarPath = Join-Path $DownloadsRoot "ncbi-blast-x64-win64.tar.gz"
     $ExtractRoot = Join-Path $TempRoot "blast_extract"
-    Invoke-Download -Url $BlastTarUrl -OutFile $TarPath
+    # NCBI BLAST 2.17 win64 tar.gz is ~75 MB; refuse anything under 50 MB
+    Invoke-Download -Url $BlastTarUrl -OutFile $TarPath -MinBytes 50000000
     if (Test-Path -LiteralPath $ExtractRoot) {
         Remove-Item -LiteralPath $ExtractRoot -Recurse -Force
     }
@@ -244,9 +293,9 @@ function Ensure-Primer3Core {
             Remove-Item -LiteralPath $Primer3Exe -Force  # 0-byte WSL leftover
         } catch {}
     }
-    Write-Status "Downloading primer3_core.exe from pinbo/SNP_Primer_Pipeline"
     $Url = "https://raw.githubusercontent.com/pinbo/SNP_Primer_Pipeline/master/bin/primer3_core.exe"
-    Invoke-WebRequest -Uri $Url -OutFile $Primer3Exe
+    # primer3_core.exe is ~150 KB upstream; refuse anything under 50 KB
+    Invoke-Download -Url $Url -OutFile $Primer3Exe -MinBytes 50000
     if (-not (Test-Path -LiteralPath $Primer3Exe)) {
         throw "Failed to download primer3_core.exe to $BinRoot"
     }
@@ -293,9 +342,8 @@ function Install-VCRedist {
     Ensure-Directory $DownloadsRoot
     $Url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
     $InstallerPath = Join-Path $DownloadsRoot "vc_redist.x64.exe"
-    if (-not (Test-Path -LiteralPath $InstallerPath)) {
-        Invoke-WebRequest -Uri $Url -OutFile $InstallerPath -UseBasicParsing
-    }
+    # vc_redist.x64.exe is ~25 MB; refuse anything under 10 MB
+    Invoke-Download -Url $Url -OutFile $InstallerPath -MinBytes 10000000
     Write-Host ""
     Write-Host "==============================================================" -ForegroundColor Yellow
     Write-Host " About to install Microsoft Visual C++ Redistributable (x64)." -ForegroundColor Yellow
@@ -404,7 +452,8 @@ function Ensure-Muscle {
     Ensure-Directory $DownloadsRoot
     Ensure-Directory $TempRoot
     $AssetPath = Join-Path $DownloadsRoot $Asset.name
-    Invoke-Download -Url $Asset.browser_download_url -OutFile $AssetPath
+    # muscle-win64.v5.3.exe is ~5 MB; refuse anything under 1 MB as truncated
+    Invoke-Download -Url $Asset.browser_download_url -OutFile $AssetPath -MinBytes 1000000
     if ($Asset.name -match "\.zip$") {
         $ExtractRoot = Join-Path $TempRoot "muscle_extract"
         if (Test-Path -LiteralPath $ExtractRoot) {
