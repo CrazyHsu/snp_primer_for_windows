@@ -185,9 +185,35 @@ function Ensure-LocalPython {
 }
 
 function Ensure-Venv {
+    # A venv carries a hard-coded path to its base interpreter in pyvenv.cfg.
+    # If a bundle is built on machine A and copied to machine B with a different
+    # Python install path, the venv launcher errors with
+    #   No Python at '<machine A path>'
+    # and pip / project install fail with exit code 103. Detect that here by
+    # running the launcher; if it can't import sys, blow the venv away and
+    # recreate it against the current $PythonExe. See CLAUDE.md section 6.11.
     param([string]$PythonExe)
     $VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
-    if (-not (Test-Path -LiteralPath $VenvPython)) {
+    $NeedRecreate = $false
+    if (Test-Path -LiteralPath $VenvPython) {
+        try {
+            $null = & $VenvPython "-c" "import sys" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Status "Existing venv is broken (launcher exit=$LASTEXITCODE); will recreate"
+                $NeedRecreate = $true
+            }
+        } catch {
+            Write-Status "Existing venv launcher could not run; will recreate"
+            $NeedRecreate = $true
+        }
+    } else {
+        $NeedRecreate = $true
+    }
+    if ($NeedRecreate) {
+        if (Test-Path -LiteralPath $VenvRoot) {
+            Write-Status "Removing stale venv: $VenvRoot"
+            Remove-Item -LiteralPath $VenvRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "venv", $VenvRoot) -Description "Creating virtual environment"
     }
     return $VenvPython

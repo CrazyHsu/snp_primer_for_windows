@@ -318,6 +318,27 @@ Invoke-WebRequest -Uri $Url -OutFile $OutFile
 未来再加新二进制下载时，**必须**走 `Invoke-Download` 且加 `-MinBytes`，
 不要直接调 `Invoke-WebRequest`。
 
+### 6.11 跨机器分发时 venv 残留 → "No Python at ..." (v9 第二轮修)
+
+zip / 拷贝 bundle 给别的电脑时，如果不小心把 `snp_primer_runtime/venv/` 一起
+带过去了，那个 venv 的 base interpreter 路径是构建机的绝对路径，目标机上几乎
+肯定不可达。表现是 pip 这步报：
+
+```
+No Python at '<构建机的 Python 路径>'
+PS>TerminatingError():"Upgrading pip failed with exit code 103"
+```
+
+**v9 修复**：`Ensure-Venv` 在 launcher 上跑一次 `python -c "import sys"` 探活；
+失败就 `Remove-Item -Recurse` 整个 venv 目录然后用当前 `$PythonExe` 重建。
+venv 里只有第三方包，重建后 `Ensure-ProjectInstalled` 重新装一遍，几秒钟的事。
+
+**分发铁律**：往别处发布 bundle 之前必须 prune
+`snp_primer_runtime/{venv,python311,workspace*,logs,tmp,downloads,bootstrap.log}`。
+v9 顶部说明的"干净副本"已经按这套清单 prune 过；以后凡是要给别人的包都按
+这套清单清一遍再 zip——**不要先在自己机器跑一次 bootstrap 再打包**，否则 venv
+/ python311 / downloads 又会进包。
+
 ---
 
 ## 7. 常用环境信息
