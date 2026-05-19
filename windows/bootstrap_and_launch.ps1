@@ -1,12 +1,16 @@
 param(
     [Parameter(Mandatory = $false)]
-    [string]$AppRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    [string]$AppRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$NoLaunch
 )
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $AppDataRoot = Join-Path (Resolve-Path $AppRoot).Path "snp_primer_runtime"
+$BundledBinRoot = Join-Path (Resolve-Path $AppRoot).Path "windows\bin"
 $RuntimeRoot = $AppDataRoot
 $PythonRoot = Join-Path $AppDataRoot "python311"
 $VenvRoot = Join-Path $AppDataRoot "venv"
@@ -187,6 +191,41 @@ function Ensure-BlastTools {
         $_.Extension -in @(".exe", ".dll")
     } | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $BinRoot $_.Name) -Force
+    }
+}
+
+function Copy-BundledBinaries {
+    if (-not (Test-Path -LiteralPath $BundledBinRoot)) {
+        return
+    }
+    Ensure-Directory $BinRoot
+    $Names = @(
+        "blastdbcmd.exe",
+        "blastn.exe",
+        "makeblastdb.exe",
+        "muscle.exe",
+        "ncbi-vdb-md.dll",
+        "nghttp2.dll",
+        "primer3_core.exe"
+    )
+    foreach ($Name in $Names) {
+        $Src = Join-Path $BundledBinRoot $Name
+        if (-not (Test-Path -LiteralPath $Src)) {
+            continue
+        }
+        $Dst = Join-Path $BinRoot $Name
+        $NeedCopy = $true
+        if (Test-Path -LiteralPath $Dst) {
+            try {
+                $NeedCopy = ((Get-Item -LiteralPath $Dst).Length -ne (Get-Item -LiteralPath $Src).Length)
+            } catch {
+                $NeedCopy = $true
+            }
+        }
+        if ($NeedCopy) {
+            Write-Status "Copying bundled binary: $Name"
+            Copy-Item -LiteralPath $Src -Destination $Dst -Force
+        }
     }
 }
 
@@ -395,6 +434,7 @@ try {
     $VenvPython = Ensure-Venv -PythonExe $PythonExe
     Ensure-ProjectInstalled -VenvPython $VenvPython
     Remove-LinuxJunkBinaries
+    Copy-BundledBinaries
     Ensure-BlastTools
     Ensure-Muscle
     Ensure-Primer3Core
@@ -408,6 +448,11 @@ try {
     Test-BinaryRunnable -Path (Join-Path $BinRoot "blastn.exe") -Name "blastn" -VersionArgs @("-version")
     Test-BinaryRunnable -Path (Join-Path $BinRoot "primer3_core.exe") -Name "primer3_core" -VersionArgs @("-about")
     Test-BinaryRunnable -Path (Join-Path $BinRoot "muscle.exe") -Name "muscle" -VersionArgs @("-version")
+
+    if ($NoLaunch) {
+        Write-Status "Bootstrap complete; not launching desktop app because -NoLaunch was set"
+        return
+    }
 
     $env:SNP_PRIMER_HOME = $RuntimeRoot
     $env:SNP_PRIMER_BINARY_ROOT = $BinRoot

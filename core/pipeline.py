@@ -11,6 +11,7 @@ SNP 引物设计流程总调度。
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -27,6 +28,11 @@ from . import getkasp3
 
 HERE = Path(__file__).resolve().parent
 ASSETS_DIR = HERE / "assets"
+BLASTDB_PARSE_SEQID_SUFFIXES = (".nos", ".nog", ".nsi", ".nsd", ".nhd", ".nhi")
+BLASTDB_FILE_SUFFIXES = (
+    ".nhr", ".nin", ".nsq", ".nog", ".nsd", ".nsi", ".nos",
+    ".ndb", ".not", ".ntf", ".nto", ".nhd", ".nhi", ".nal",
+)
 
 
 # Windows 上每次 subprocess.call(shell=True) 都会弹一个 cmd.exe 黑窗，再加 .exe
@@ -214,9 +220,8 @@ def _check_blastdb_has_parse_seqids(db_prefix):
     db_prefix 可能是绝对路径（比如经过 _blast_safe_db_path() junction 之后的
     路径），也可能是带空格短名。检查时按 prefix + 后缀直接 stat。
     """
-    suffixes = (".nos", ".nog", ".nsi", ".nsd", ".nhd", ".nhi")
     db_prefix = os.fspath(db_prefix)
-    if any(os.path.isfile(db_prefix + suf) for suf in suffixes):
+    if any(os.path.isfile(db_prefix + suf) for suf in BLASTDB_PARSE_SEQID_SUFFIXES):
         return
     # 没找到任何 parse_seqids 产物。报错给用户能动手的提示。
     base_dir = os.path.dirname(db_prefix) or "."
@@ -230,6 +235,175 @@ def _check_blastdb_has_parse_seqids(db_prefix):
         f"  makeblastdb -in <你的染色体fasta> -dbtype nucl -parse_seqids -out {base_name}\n"
         f"重建完保留同样的前缀（{base_name}），GUI 不用改设置直接重跑。"
     )
+
+
+def _blastdb_has_parse_seqids(db_prefix):
+    db_prefix = os.fspath(db_prefix)
+    return any(os.path.isfile(db_prefix + suf) for suf in BLASTDB_PARSE_SEQID_SUFFIXES)
+
+
+def _blastdb_has_core_files(db_prefix):
+    db_prefix = os.fspath(db_prefix)
+    old_style = all(os.path.isfile(db_prefix + suf) for suf in (".nhr", ".nin", ".nsq"))
+    new_style = any(os.path.isfile(db_prefix + suf) for suf in (".ndb", ".nal"))
+    return old_style or new_style
+
+
+def _first_fasta_seqid(fasta_path):
+    try:
+        with open(fasta_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith(">"):
+                    return line[1:].strip().split()[0]
+    except OSError:
+        return None
+    return None
+
+
+def _candidate_db_prefixes_for_fasta(fasta_path):
+    fasta_path = Path(fasta_path)
+    candidates = []
+
+    def add(candidate):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(fasta_path.with_suffix(""))
+    add(fasta_path.parent / (fasta_path.stem + ".blast_db"))
+
+    seqid = _first_fasta_seqid(fasta_path)
+    seqid_variants = []
+    if seqid:
+        seqid_variants.append(seqid)
+        seqid_variants.append(seqid[:1].upper() + seqid[1:])
+        if seqid.lower().startswith("chr"):
+            seqid_variants.append("Chr" + seqid[3:])
+            seqid_variants.append("chr" + seqid[3:])
+    for name in seqid_variants:
+        add(fasta_path.parent / name)
+
+    m = re.search(r"(chr[0-9A-Za-z]+)", fasta_path.stem, re.IGNORECASE)
+    if m:
+        chrom = m.group(1)
+        add(fasta_path.parent / chrom)
+        add(fasta_path.parent / (chrom[:1].upper() + chrom[1:]))
+        if chrom.lower().startswith("chr"):
+            add(fasta_path.parent / ("Chr" + chrom[3:]))
+
+    return candidates
+
+
+def _find_existing_parse_seqids_db_for_fasta(fasta_path, log):
+    for prefix in _candidate_db_prefixes_for_fasta(fasta_path):
+        if not _blastdb_has_core_files(prefix):
+            continue
+        if _blastdb_has_parse_seqids(prefix):
+            log(f"发现 Reference FASTA 旁已有 -parse_seqids BLAST 库：{prefix}")
+            return Path(prefix)
+        log(f"跳过已有 BLAST 库 {prefix}：缺少 -parse_seqids 索引文件。")
+    return None
+
+
+def _mirror_blastdb_to_prefix(source_prefix, dest_prefix, log):
+    source_prefix = Path(source_prefix)
+    dest_prefix = Path(dest_prefix)
+    dest_prefix.parent.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    linked = 0
+    for suffix in BLASTDB_FILE_SUFFIXES:
+        src = Path(str(source_prefix) + suffix)
+        if not src.is_file():
+            continue
+        dst = Path(str(dest_prefix) + suffix)
+        try:
+            if dst.exists():
+                dst_stat = dst.stat()
+                src_stat = src.stat()
+                if (
+                    dst_stat.st_size == src_stat.st_size
+                    and dst_stat.st_mtime >= src_stat.st_mtime
+                ):
+                    continue
+                dst.unlink()
+            os.link(src, dst)
+            linked += 1
+        except OSError:
+            shutil.copy2(src, dst)
+            copied += 1
+    if not _blastdb_has_core_files(dest_prefix):
+        raise RuntimeError(f"镜像已有 BLAST 库失败，目标缺少核心索引文件：{dest_prefix}")
+    _check_blastdb_has_parse_seqids(dest_prefix)
+    log(f"已把已有 BLAST 库镜像到 {dest_prefix}（hardlink={linked}, copy={copied}）。")
+    return str(dest_prefix)
+
+
+def _is_ascii_no_whitespace_path(p):
+    text = os.fspath(p)
+    try:
+        text.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return not any(ch.isspace() for ch in text)
+
+
+def _safe_stage_suffix(path):
+    suffix = Path(path).suffix.lower()
+    if suffix and suffix.encode("ascii", errors="ignore").decode("ascii") == suffix:
+        if not any(ch.isspace() for ch in suffix) and len(suffix) <= 12:
+            return suffix
+    return ".fa"
+
+
+def _stage_fasta_for_makeblastdb(fasta_path, auto_db_dir, log):
+    """Return a makeblastdb-safe FASTA path, staging only when needed.
+
+    NCBI Windows binaries can crash before printing stderr when they receive
+    paths containing non-ASCII characters or spaces. The BLAST DB prefix is
+    already under the workspace; this helper makes the ``-in`` FASTA path just
+    as boring while keeping the GUI's Reference FASTA workflow intact.
+    """
+    if _is_ascii_no_whitespace_path(fasta_path):
+        return fasta_path
+
+    stage_dir = Path(auto_db_dir) / "_fasta_stage"
+    if not _is_ascii_no_whitespace_path(stage_dir):
+        raise RuntimeError(
+            "Reference FASTA 路径包含中文或空格，需要先暂存到工作目录再运行 makeblastdb；\n"
+            f"但当前暂存目录也不是纯 ASCII 且无空格：{stage_dir}\n"
+            "请把 Working dir 改到一个纯英文、无空格路径后重试。"
+        )
+
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(str(fasta_path).encode("utf-8")).hexdigest()[:12]
+    staged = stage_dir / f"reference_{digest}{_safe_stage_suffix(fasta_path)}"
+
+    source_stat = Path(fasta_path).stat()
+    if staged.exists():
+        try:
+            staged_stat = staged.stat()
+            if (
+                staged_stat.st_size == source_stat.st_size
+                and staged_stat.st_mtime >= source_stat.st_mtime
+            ):
+                log(f"Reference FASTA 已暂存：{staged}")
+                return staged
+            staged.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"无法更新 Reference FASTA 暂存文件：{staged}\n{exc}"
+            ) from exc
+
+    try:
+        os.link(fasta_path, staged)
+        method = "hardlink"
+    except OSError:
+        shutil.copy2(fasta_path, staged)
+        method = "copy"
+    log(
+        "Reference FASTA 路径含中文或空格，已"
+        f"通过 {method} 暂存到 {staged}，makeblastdb 将使用该暂存路径。"
+    )
+    return staged
 
 
 def _ensure_blastdb_from_fasta(fasta_path, workdir, bin_dir, log):
@@ -251,6 +425,10 @@ def _ensure_blastdb_from_fasta(fasta_path, workdir, bin_dir, log):
     if nhr.is_file() and nhr.stat().st_mtime >= fasta_path.stat().st_mtime:
         log(f"已存在 BLAST 库 {db_prefix}（mtime ≥ FASTA），跳过 makeblastdb。")
         return str(db_prefix)
+    existing_db = _find_existing_parse_seqids_db_for_fasta(fasta_path, log)
+    if existing_db:
+        return _mirror_blastdb_to_prefix(existing_db, db_prefix, log)
+    makeblastdb_fasta = _stage_fasta_for_makeblastdb(fasta_path, auto_db_dir, log)
     makeblastdb_bin = _which("makeblastdb", [bin_dir])
     if not makeblastdb_bin:
         raise RuntimeError(
@@ -260,17 +438,26 @@ def _ensure_blastdb_from_fasta(fasta_path, workdir, bin_dir, log):
         )
     log(f"Step 0: 用 makeblastdb 自动从 {fasta_path} 建索引到 {db_prefix}")
     cmd = [makeblastdb_bin,
-           "-in", str(fasta_path),
+           "-in", str(makeblastdb_fasta),
            "-dbtype", "nucl",
            "-parse_seqids",
            "-out", str(db_prefix)]
     r = _run(cmd, log)
     if r.returncode != 0 or not nhr.is_file():
         out_log = (r.stdout or "").strip() or "(no output captured)"
+        access_violation_hint = ""
+        if r.returncode in (3221225477, -1073741819):
+            access_violation_hint = (
+                "\n\n检测到 Windows 访问冲突 0xC0000005。常见触发原因是 "
+                "NCBI makeblastdb 在 PyInstaller/Windows 环境下处理中文、空格路径或 "
+                "DLL runtime 时直接崩溃。"
+            )
         raise RuntimeError(
             f"makeblastdb 失败 (returncode={r.returncode}, fasta={fasta_path})。\n"
+            f"makeblastdb 实际 -in：{makeblastdb_fasta}\n"
             f"输出：\n{out_log}\n\n"
             f"常见原因：FASTA 不是 nucl / 文件已损坏 / 路径含特殊字符。"
+            f"{access_violation_hint}"
         )
     return str(db_prefix)
 

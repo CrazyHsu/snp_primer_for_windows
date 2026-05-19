@@ -2,10 +2,9 @@
 REM ============================================================
 REM  Build a self-contained SNPPrimerDesktop.exe with PyInstaller.
 REM
-REM  Prerequisite: run "windows\Launch SNP Primer Desktop.cmd"
-REM  at least once. That bootstrap creates snp_primer_runtime\venv
-REM  and downloads BLAST+/primer3/muscle binaries to
-REM  snp_primer_runtime\bin\ -- this script reads from both.
+REM  Prerequisite: none in the normal case. If venv/bin are missing, this
+REM  script bootstraps them first. BLAST/primer3/muscle are copied from
+REM  windows\bin\ when present, so no download is needed for those tools.
 REM
 REM  Output: dist\SNPPrimerDesktop\SNPPrimerDesktop.exe
 REM    (a folder distribution; ~70-100 MB; double-click to launch,
@@ -18,9 +17,13 @@ if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 REM --- Step 1: activate dev venv -------------------------------
 set "VENV_ACT=%ROOT%\snp_primer_runtime\venv\Scripts\activate.bat"
 if not exist "%VENV_ACT%" (
-  echo [ERROR] dev venv not found at:
+  echo [BUILD] dev venv not found; bootstrapping runtime without launching GUI...
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\windows\bootstrap_and_launch.ps1" -AppRoot "%ROOT%" -NoLaunch
+  if errorlevel 1 goto :err
+)
+if not exist "%VENV_ACT%" (
+  echo [ERROR] dev venv still not found after bootstrap:
   echo   %VENV_ACT%
-  echo Run "windows\Launch SNP Primer Desktop.cmd" once to bootstrap it.
   goto :err
 )
 call "%VENV_ACT%" || goto :err
@@ -32,10 +35,19 @@ if errorlevel 1 goto :err
 
 REM --- Step 3: verify required Windows binaries exist ----------
 set "BIN=%ROOT%\snp_primer_runtime\bin"
+set "NEED_BOOTSTRAP="
+for %%F in (blastn.exe blastdbcmd.exe makeblastdb.exe primer3_core.exe muscle.exe nghttp2.dll ncbi-vdb-md.dll) do (
+  if not exist "%BIN%\%%F" set "NEED_BOOTSTRAP=1"
+)
+if defined NEED_BOOTSTRAP (
+  echo [BUILD] required runtime binaries missing; bootstrapping runtime without launching GUI...
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\windows\bootstrap_and_launch.ps1" -AppRoot "%ROOT%" -NoLaunch
+  if errorlevel 1 goto :err
+)
 for %%F in (blastn.exe blastdbcmd.exe makeblastdb.exe primer3_core.exe muscle.exe nghttp2.dll ncbi-vdb-md.dll) do (
   if not exist "%BIN%\%%F" (
     echo [ERROR] missing binary: %BIN%\%%F
-    echo Run "windows\Launch SNP Primer Desktop.cmd" once first; bootstrap will download all binaries.
+    echo Check windows\bin\ or run "windows\Launch SNP Primer Desktop.cmd" once.
     goto :err
   )
 )
@@ -79,8 +91,11 @@ REM subprocess launches them, Windows DLL search finds nghttp2.dll /
 REM ncbi-vdb-md.dll alongside the .exe (correct behavior) WITHOUT
 REM contention from Python's bundled VC runtime in _internal/.
 echo [BUILD] copying NCBI binaries to dist\SNPPrimerDesktop\bin\ ...
-xcopy /E /I /Y /Q "%BIN%" "%ROOT%\dist\SNPPrimerDesktop\bin\" >nul
-if errorlevel 1 goto :err
+if not exist "%ROOT%\dist\SNPPrimerDesktop\bin" mkdir "%ROOT%\dist\SNPPrimerDesktop\bin"
+for %%F in (blastn.exe blastdbcmd.exe makeblastdb.exe primer3_core.exe muscle.exe nghttp2.dll ncbi-vdb-md.dll) do (
+  copy /Y "%BIN%\%%F" "%ROOT%\dist\SNPPrimerDesktop\bin\%%F" >nul
+  if errorlevel 1 goto :err
+)
 
 REM --- Step 6: success summary ---------------------------------
 echo.

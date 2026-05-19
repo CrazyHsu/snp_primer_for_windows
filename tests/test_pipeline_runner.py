@@ -4,6 +4,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from core import pipeline as core_pipeline
 from snp_primer_app.models import BinaryBundle, PipelineRequest
 from snp_primer_app.pipeline_runner import PipelineRunner
 
@@ -26,15 +27,15 @@ class PipelineRunnerTest(unittest.TestCase):
                 """
                 #!/bin/bash
                 infile=""
+                out=""
                 while [ "$#" -gt 0 ]; do
-                  if [ "$1" = "-in" ]; then
-                    infile="$2"
-                    shift 2
-                  else
-                    shift
-                  fi
+                  case "$1" in
+                    -in) infile="$2"; shift 2 ;;
+                    -out) out="$2"; shift 2 ;;
+                    *) shift ;;
+                  esac
                 done
-                touch "${infile}.nin" "${infile}.nsq" "${infile}.nhr"
+                touch "${out}.nin" "${out}.nsq" "${out}.nhr" "${out}.nsi"
                 """,
             )
             self._write_script(
@@ -63,7 +64,14 @@ EOF
                 bin_dir / "blastdbcmd",
                 f"""
                 #!/bin/bash
-                cat <<'EOF'
+                out=""
+                while [ "$#" -gt 0 ]; do
+                  case "$1" in
+                    -out) out="$2"; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                cat > "$out" <<'EOF'
 >chr7A
 {target}
 >chr7B
@@ -161,6 +169,89 @@ EOF
             self.assertIn("-Common", kasp_text)
             self.assertIn("EcoRV,15", caps_text)
             self.assertTrue(result.all_alignment_raw.exists())
+
+    def test_reference_fasta_with_non_ascii_path_is_staged_for_makeblastdb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            source_dir = tmp / "参考目录"
+            source_dir.mkdir()
+            reference_fasta = source_dir / "reference.fa"
+            reference_fasta.write_text(">chr7A\nACGT\n", encoding="utf-8")
+            args_file = tmp / "makeblastdb_in.txt"
+
+            self._write_script(
+                bin_dir / "makeblastdb",
+                f"""
+                #!/bin/bash
+                infile=""
+                out=""
+                while [ "$#" -gt 0 ]; do
+                  case "$1" in
+                    -in) infile="$2"; shift 2 ;;
+                    -out) out="$2"; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                printf '%s\\n' "$infile" > "{args_file}"
+                touch "${{out}}.nin" "${{out}}.nsq" "${{out}}.nhr" "${{out}}.nsi"
+                """,
+            )
+
+            workdir = tmp / "work"
+            logs: list[str] = []
+            db_prefix = core_pipeline._ensure_blastdb_from_fasta(
+                reference_fasta,
+                workdir,
+                bin_dir,
+                logs.append,
+            )
+
+            makeblastdb_in = args_file.read_text(encoding="utf-8").strip()
+            self.assertEqual(db_prefix, str(workdir / "auto_blastdb" / "reference"))
+            self.assertNotEqual(makeblastdb_in, str(reference_fasta.resolve()))
+            self.assertNotIn("参考目录", makeblastdb_in)
+            self.assertIn("_fasta_stage", makeblastdb_in)
+            self.assertTrue(Path(makeblastdb_in).exists())
+
+    def test_reference_fasta_reuses_adjacent_parse_seqids_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            source_dir = tmp / "参考目录"
+            source_dir.mkdir()
+            reference_fasta = source_dir / "iwgsc_refseqv1.0_chr7A.fsa"
+            reference_fasta.write_text(">chr7A\nACGT\n", encoding="utf-8")
+            for suffix in (".nhr", ".nin", ".nsq", ".nsi", ".nsd", ".nog"):
+                (source_dir / f"Chr7A{suffix}").write_text(suffix, encoding="utf-8")
+
+            self._write_script(
+                bin_dir / "makeblastdb",
+                """
+                #!/bin/bash
+                echo makeblastdb should not run >&2
+                exit 7
+                """,
+            )
+
+            workdir = tmp / "work"
+            logs: list[str] = []
+            db_prefix = core_pipeline._ensure_blastdb_from_fasta(
+                reference_fasta,
+                workdir,
+                bin_dir,
+                logs.append,
+            )
+
+            self.assertEqual(
+                db_prefix,
+                str(workdir / "auto_blastdb" / "iwgsc_refseqv1.0_chr7A"),
+            )
+            self.assertTrue(Path(db_prefix + ".nhr").exists())
+            self.assertTrue(Path(db_prefix + ".nsi").exists())
+            self.assertTrue(any("已有 -parse_seqids BLAST 库" in msg for msg in logs))
 
     def _write_script(self, path: Path, body: str) -> None:
         path.write_text(textwrap.dedent(body).strip() + "\n", encoding="utf-8")

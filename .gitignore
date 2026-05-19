@@ -20,8 +20,8 @@ snp_primer_runtime/tmp/
 snp_primer_runtime/downloads/
 snp_primer_runtime/bootstrap.log
 
-# ─── BLAST / primer3 / muscle 二进制 ───
-# bootstrap_and_launch.ps1 会自动下载，不入库
+# ─── Runtime 里复制出来的 BLAST / primer3 / muscle 二进制 ───
+# 仓库自带的固定二进制放在 windows/bin/，这里只忽略运行时副本。
 snp_primer_runtime/bin/*.exe
 snp_primer_runtime/bin/*.dll
 
