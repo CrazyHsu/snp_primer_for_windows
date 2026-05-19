@@ -274,10 +274,14 @@ function Copy-BundledBinaries {
         return
     }
     Ensure-Directory $BinRoot
+    # Accept both muscle5.exe (correct, v9+) and muscle.exe (legacy v8 name).
+    # Whichever exists under windows/bin gets copied through; Ensure-Muscle
+    # handles any rename/migration on the runtime side.
     $Names = @(
         "blastdbcmd.exe",
         "blastn.exe",
         "makeblastdb.exe",
+        "muscle5.exe",
         "muscle.exe",
         "ncbi-vdb-md.dll",
         "nghttp2.dll",
@@ -462,10 +466,26 @@ function Test-BinaryRunnable {
 }
 
 function Ensure-Muscle {
-    $MuscleExe = Join-Path $BinRoot "muscle.exe"
-    if (Test-Path -LiteralPath $MuscleExe) {
+    # NCBI muscle v5 uses '-align <in> -output <out>'; v3 used '-in <in> -out <out>'.
+    # core/getkasp3.py:_muscle_align_cmd selects syntax by filename:
+    #   muscle5.exe -> v5 syntax
+    #   muscle.exe  -> v3 syntax (fallback)
+    # We always download v5 (rcedgar/muscle latest), so always save as muscle5.exe.
+    # get_software_path() also prefers muscle5.exe over muscle.exe. See CLAUDE.md
+    # section 6.12 for the bug history (KASP `[Errno 2] alignment_raw_*.fa`).
+    $Muscle5Exe = Join-Path $BinRoot "muscle5.exe"
+    $LegacyMuscle = Join-Path $BinRoot "muscle.exe"
+
+    # Migrate existing installs that saved v5 as muscle.exe (v8 / early v9).
+    # One-time rename, idempotent.
+    if ((Test-Path -LiteralPath $LegacyMuscle) -and (-not (Test-Path -LiteralPath $Muscle5Exe))) {
+        Write-Status "Renaming legacy bin\muscle.exe to muscle5.exe (v5 download had the wrong name)"
+        Move-Item -LiteralPath $LegacyMuscle -Destination $Muscle5Exe -Force
+    }
+    if (Test-Path -LiteralPath $Muscle5Exe) {
         return
     }
+
     Ensure-Directory $BinRoot
     Write-Status "Downloading MUSCLE latest Windows release"
     $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/rcedgar/muscle/releases/latest"
@@ -490,10 +510,10 @@ function Ensure-Muscle {
         if (-not $Found) {
             throw "Downloaded MUSCLE archive but no muscle.exe was found."
         }
-        Copy-Item -LiteralPath $Found.FullName -Destination $MuscleExe -Force
+        Copy-Item -LiteralPath $Found.FullName -Destination $Muscle5Exe -Force
         return
     }
-    Copy-Item -LiteralPath $AssetPath -Destination $MuscleExe -Force
+    Copy-Item -LiteralPath $AssetPath -Destination $Muscle5Exe -Force
 }
 
 Ensure-Directory $RuntimeRoot
@@ -522,7 +542,12 @@ try {
     # mid-pipeline with an empty stderr. Should always pass after Ensure-VCRedist.
     Test-BinaryRunnable -Path (Join-Path $BinRoot "blastn.exe") -Name "blastn" -VersionArgs @("-version")
     Test-BinaryRunnable -Path (Join-Path $BinRoot "primer3_core.exe") -Name "primer3_core" -VersionArgs @("-about")
-    Test-BinaryRunnable -Path (Join-Path $BinRoot "muscle.exe") -Name "muscle" -VersionArgs @("-version")
+    # Prefer muscle5.exe; fall back to legacy muscle.exe if user has the old name.
+    $MuscleProbe = Join-Path $BinRoot "muscle5.exe"
+    if (-not (Test-Path -LiteralPath $MuscleProbe)) {
+        $MuscleProbe = Join-Path $BinRoot "muscle.exe"
+    }
+    Test-BinaryRunnable -Path $MuscleProbe -Name "muscle" -VersionArgs @("-version")
 
     if ($NoLaunch) {
         Write-Status "Bootstrap complete; not launching desktop app because -NoLaunch was set"
