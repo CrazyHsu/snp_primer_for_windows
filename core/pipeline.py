@@ -590,19 +590,38 @@ def _stage_fasta_for_makeblastdb(fasta_path, auto_db_dir, log):
     return staged
 
 
-def _ensure_blastdb_from_fasta(fasta_path, workdir, bin_dir, log):
+def _ensure_blastdb_from_fasta(fasta_path, workdir, bin_dir, log, *, cache_root=None):
     """给 raw FASTA 自动建 BLAST 库，返回 prefix。
 
-    建出的库放在 ``<workdir>/auto_blastdb/<fasta_stem>``。workdir 由 GUI 保证
-    是无空格 ASCII 路径，正好绕过 §6.7 那道"BLAST 路径按空格 split"的坎。
+    缓存位置：
+    - ``cache_root`` 指定时（GUI 路径）：库放在
+      ``<cache_root>/auto_blastdb/<fasta_stem>__<sha256[:8]>/<fasta_stem>``，
+      跨 run 共享（v14 §6.23）。GUI 把 ``working_dir_var``（workspace 根）
+      传进来，多次 Run Pipeline 不再重建索引。
+    - ``cache_root`` 未指定（Layer A 测试 / 直接 API 调用）：fall back 到
+      ``<workdir>/auto_blastdb/<fasta_stem>__<sha256[:8]>/<fasta_stem>``，行为
+      与单次 run 等价。
 
-    缓存：如果 ``<prefix>.nhr`` 已经存在且 mtime ≥ FASTA 的 mtime，跳过 rebuild。
-    建库本身要走 ``-parse_seqids``，否则后面 blastdbcmd 还是反查不出来，等于没建。
+    ``<stem>__<sha256[:8]>`` 子目录用绝对路径 sha256 前 8 hex 做后缀，防止两
+    个 basename 相同、内容不同的 FASTA 在共享缓存里互相覆盖。
+
+    workdir / cache_root 由 GUI 保证是无空格 ASCII 路径，绕过 §6.7 "BLAST
+    路径按空格 split"。
+
+    缓存命中：如果 ``<prefix>.nhr`` 已经存在且 mtime ≥ FASTA 的 mtime，跳过
+    rebuild。建库本身要走 ``-parse_seqids``，否则后面 blastdbcmd 还是反查不出
+    来，等于没建。
     """
     fasta_path = Path(fasta_path).resolve()
     if not fasta_path.is_file():
         raise RuntimeError(f"reference_fasta 找不到文件：{fasta_path}")
-    auto_db_dir = Path(workdir) / "auto_blastdb"
+    auto_db_dir_base = (
+        Path(cache_root) / "auto_blastdb"
+        if cache_root is not None
+        else Path(workdir) / "auto_blastdb"
+    )
+    digest = hashlib.sha256(str(fasta_path).encode("utf-8")).hexdigest()[:8]
+    auto_db_dir = auto_db_dir_base / f"{fasta_path.stem}__{digest}"
     auto_db_dir.mkdir(parents=True, exist_ok=True)
     db_prefix = auto_db_dir / fasta_path.stem
     nhr = Path(str(db_prefix) + ".nhr")
@@ -704,6 +723,11 @@ def run(*,
         remote_email=None,
         cancel_event=None,
         species_key="wheat",  # v13: 用户选的物种 key，详见 v13 CLAUDE.md §6.22
+        # v14 §6.23: workspace 根目录，用来跨 run 共享 auto_blastdb 缓存。
+        # GUI 传 `working_dir_var`（不动的 workspace 根），让多次 Run Pipeline
+        # 复用同一份 makeblastdb 索引。None 时 fall back 到 <workdir>/auto_blastdb，
+        # Layer A 测试 / 直接 API 调用走该路径，行为与单次 run 等价。
+        cache_root=None,
         log=print):
     """
     跑完整 SNP 引物设计流程。
@@ -815,7 +839,9 @@ def run(*,
     # 输入到底是 FASTA 还是 prefix。
     if reference_fasta and not reference_db:
         reference_db = _ensure_blastdb_from_fasta(
-            reference_fasta, workdir, bin_dir_str, log)
+            reference_fasta, workdir, bin_dir_str, log,
+            cache_root=cache_root,
+        )
     if reference_db:
         reference_db = str(Path(reference_db).resolve())
         # v11: 多卷库（makeblastdb 自动切片成 .00 / .01 / …）但缺 .nal alias 时，

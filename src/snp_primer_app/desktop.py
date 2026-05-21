@@ -720,7 +720,9 @@ class DesktopApp:
             self.stop_button.configure(state="normal")
         self.run_thread = threading.Thread(
             target=self._run_pipeline_worker,
-            args=(request, binaries, run_workdir),
+            # v14 §6.23: base_workdir（workspace 根）也喂进去做 auto_blastdb
+            # 共享缓存的位置，跨 run 复用 makeblastdb 索引。
+            args=(request, binaries, run_workdir, base_workdir),
             daemon=True,
         )
         self.run_thread.start()
@@ -740,6 +742,7 @@ class DesktopApp:
         request: PipelineRequest,
         binaries: BinaryBundle,
         working_dir: Path,
+        cache_root: Path,
     ) -> None:
         # 延迟 import：避免模块顶端 import core.pipeline 触发 Layer A 的 standalone
         # 测试期望。这里 worker 已经在 PipelineRunner.run() 上下文里，core 早已加载。
@@ -751,6 +754,8 @@ class DesktopApp:
                 working_dir=working_dir,
                 logger=self._queue_log,
                 cancel_event=self.cancel_event,
+                # v14 §6.23: workspace 根做 auto_blastdb 共享缓存的位置。
+                cache_root=cache_root,
             ).run()
         except PipelineCancelled as exc:
             self.ui_queue.put(("cancelled", str(exc)))

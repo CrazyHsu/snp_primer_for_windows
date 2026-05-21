@@ -39,12 +39,17 @@ class PipelineRunner:
         *,
         logger: LogFn | None = None,
         cancel_event: threading.Event | None = None,
+        # v14 §6.23: workspace 根目录（GUI 的 working_dir_var），用来跨 run
+        # 共享 auto_blastdb 缓存。GUI 传 base_workdir；命令行 / 测试不传时
+        # core.pipeline.run 会 fall back 到 <workdir>/auto_blastdb。
+        cache_root: str | Path | None = None,
     ) -> None:
         self.request = request
         self.binaries = binaries
         self.working_dir = Path(working_dir)
         self.logger = logger
         self.cancel_event = cancel_event
+        self.cache_root = Path(cache_root) if cache_root is not None else None
 
     def run(self) -> PipelineRunResult:
         self.working_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +93,11 @@ class PipelineRunner:
             do_primer_blast=bool(self.request.blast_primers),
             bin_dir=str(bin_dir),
             cancel_event=self.cancel_event,
+            # v13: 把 GUI 选的物种 key 传给 core.pipeline.run，让 ENTREZ_QUERY
+            # / 染色体正则 / ABD 过滤都按 species 走。默认 "wheat"。
+            species_key=self.request.species_key,
+            # v14 §6.23: 跨 run 共享 auto_blastdb 的位置（GUI workspace 根）。
+            cache_root=self.cache_root,
             log=_log,
         )
 
