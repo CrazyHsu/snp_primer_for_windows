@@ -26,6 +26,14 @@ OTHER_ONLINE_MODE = "Other Online Provider"
 
 
 class DesktopApp:
+    # SNP Input 启动预填 + Example Input 按钮共用同一份示例字符串，避免两处漂移。
+    _EXAMPLE_SNP_INPUT = (
+        "IWB50236,7A,cctcctcgtttcaaaagaagtaactcatcaaatgattcaaaaatatcgat[A/G]"
+        "CTTGGCTGGTGTATCGTGCAGACGACAGTTCGTCCGGTATCAACAGCATT\n"
+        "IWB58849,7A,ATGACAATCAGAGCATGGAAGAAGACTTCGAGAAAGGAACCGCGCCCAAG[T/C]"
+        "GGTTTTGCTACAGCGACTTGGCCATGGCCACCGACAACTTTTCCGACGAT\n"
+    )
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("SNP Primer Desktop")
@@ -67,6 +75,10 @@ class DesktopApp:
         self._mono_font = ("Consolas", 12)
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.run_thread: threading.Thread | None = None
+        # 协作式取消：每次 Run Pipeline clear()，Stop 按钮 set()，worker 线程
+        # 在 step 边界 / online polling 检查（详见 §6.18）。
+        self.cancel_event: threading.Event = threading.Event()
+        self.stop_button: ttk.Button | None = None  # 在 _build_layout 里赋值
         runtime_dirs = ensure_runtime_dirs()
 
         self.mode_var = tk.StringVar(value=LOCAL_MODE)
@@ -88,6 +100,28 @@ class DesktopApp:
         self.binary_root_var = tk.StringVar(value=str(runtime_dirs["bin"]))
         self.status_var = tk.StringVar(value="Idle")
 
+        # 快照参数行的默认值，给 Reset Params 按钮用。SNP Input / Log /
+        # status_var 不在里面（Clear SNP Input / Clear Log 各自负责）。
+        self._param_defaults: dict[str, object] = {
+            "mode_var": self.mode_var.get(),
+            "reference_path_var": self.reference_path_var.get(),
+            "local_blast_db_var": self.local_blast_db_var.get(),
+            "remote_provider_var": self.remote_provider_var.get(),
+            "remote_database_var": self.remote_database_var.get(),
+            "remote_fetch_database_var": self.remote_fetch_database_var.get(),
+            "remote_email_var": self.remote_email_var.get(),
+            "ploidy_var": self.ploidy_var.get(),
+            "max_price_var": self.max_price_var.get(),
+            "design_caps_var": self.design_caps_var.get(),
+            "design_kasp_var": self.design_kasp_var.get(),
+            "blast_primers_var": self.blast_primers_var.get(),
+            "max_tm_var": self.max_tm_var.get(),
+            "max_size_var": self.max_size_var.get(),
+            "pick_anyway_var": self.pick_anyway_var.get(),
+            "working_dir_var": self.working_dir_var.get(),
+            "binary_root_var": self.binary_root_var.get(),
+        }
+
         # 持久化 GUI 日志：每次启动建一个时间戳文件，便于失败后把整段贴出来排查。
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self._log_path: Path = runtime_dirs["logs"] / f"desktop_{ts}.log"
@@ -104,6 +138,8 @@ class DesktopApp:
         outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill=tk.BOTH, expand=True)
 
+        # Reset Params 第六轮放过 outer 顶端 header（独占一行不好看），第七轮
+        # 挪到 Design Options form 的右下空白区（见下面 form 段末）。
         top = ttk.LabelFrame(outer, text="BLAST Source And Runtime", padding=10)
         top.pack(fill=tk.X)
 
@@ -135,19 +171,54 @@ class DesktopApp:
         self.local_blast_db_var.trace_add("write", self._update_blast_input_lockout)
 
         ttk.Label(top, text="Online database").grid(row=3, column=0, sticky=tk.W, pady=4)
+        # 顺序与 NCBI Web BLAST "Standard databases" 下拉完全一致（2026-05-21 抓
+        # 的 HTML，21 个 value）。**不要再加旧 "nt"**——NCBI 当前下拉里没这个
+        # value 了，传上去会被服务器静默 fallback 到 core_nt。
+        # 详见 §6.20。Combobox normal-state 允许用户手输自定义 db 名（NCBI 偶尔
+        # 上新库未收录时备用）。
         self.remote_db_combo = ttk.Combobox(
             top,
             textvariable=self.remote_database_var,
             values=[
-                "nt",
+                "nt_euk",
+                "nt_prok",
+                "nt_viruses",
+                "nt_others",
                 "core_nt",
-                "refseq_genomes",
-                "refseq_representative_genomes",
+                "refseq_select",
                 "refseq_rna",
+                "refseq_reference_genomes",
+                "refseq_genomes",
+                "nr/nt",
                 "wgs",
+                "est",
+                "sra",
+                "tsa",
+                "tls",
+                "htgs",
+                "pat",
+                "pdb",
+                "refseq_gene",
+                "gss",
+                "dbsts",
             ],
         )
         self.remote_db_combo.grid(row=3, column=1, sticky=tk.EW, pady=4)
+        # 默认 normal-state Combobox 只在点小箭头时弹下拉，留作手输自定义 DB
+        # 名仍可。点击 entry 部分也想弹——但不能用 event_generate("<Down>")：
+        # key 事件按当前键盘焦点 deliver，widget-level Button-1 binding 触发时
+        # 焦点还没移过来，结果 <Down> 误送到上一个被聚焦的 Combobox（例如
+        # mode_combo）→ mode 下拉被弹出。改用 Tcl-level ttk::combobox::Post
+        # 直接对指定 widget 上 popdown，跟焦点无关。详见 §6.17。
+        def _open_remote_db_dropdown(event):
+            try:
+                event.widget.tk.call("ttk::combobox::Post", event.widget)
+            except tk.TclError:
+                event.widget.focus_set()
+                event.widget.after(
+                    1, lambda w=event.widget: w.event_generate("<Down>")
+                )
+        self.remote_db_combo.bind("<Button-1>", _open_remote_db_dropdown)
 
         ttk.Label(top, text="Other provider").grid(row=4, column=0, sticky=tk.W, pady=4)
         self.remote_provider_combo = ttk.Combobox(
@@ -165,6 +236,11 @@ class DesktopApp:
         ttk.Label(top, text="Contact email").grid(row=6, column=0, sticky=tk.W, pady=4)
         self.remote_email_entry = ttk.Entry(top, textvariable=self.remote_email_var, width=90)
         self.remote_email_entry.grid(row=6, column=1, sticky=tk.EW, pady=4)
+        ttk.Label(
+            top,
+            text="(NCBI recommended, EBI required)",
+            foreground="#666666",
+        ).grid(row=6, column=2, sticky=tk.W, padx=6, pady=4)
 
         ttk.Label(top, text="Binary root").grid(row=7, column=0, sticky=tk.W, pady=4)
         self.binary_root_entry = ttk.Entry(top, textvariable=self.binary_root_var, width=90)
@@ -216,25 +292,50 @@ class DesktopApp:
             row=1, column=3, sticky=tk.W, pady=4
         )
 
+        # 第七轮：Reset Params 挪到 Design Options form 右下空白处。col=8 设
+        # weight=1 让列吃掉剩余水平 space，把按钮推到 form 最右边沿；rowspan=2
+        # 让按钮纵跨两行，grid 默认 cell-内 anchor=CENTER 自动垂直居中。
+        form.columnconfigure(8, weight=1)
+        ttk.Button(form, text="Reset Params", command=self.reset_params).grid(
+            row=0, column=8, rowspan=2, sticky=tk.E, padx=(20, 0)
+        )
+
         input_frame = ttk.LabelFrame(outer, text="SNP Input", padding=10)
         # SNP Input 是给用户贴 polymarker 行的，4–6 行就够；不再 expand=True，
         # 让出垂直空间给下面 Notebook 的结果展示。
         input_frame.pack(fill=tk.X, expand=False, pady=(12, 0))
+        # Clear SNP Input 按钮贴在文本框右侧。第七轮去掉 anchor=N（之前贴顶
+        # 跟 Text 第一行齐，下面 4 行 Text 没视觉对齐）；pack 默认 anchor=CENTER
+        # 让按钮在垂直方向居中到 Text 的中点。
+        # 第八轮：右侧两按钮上下纵向堆叠（占用横向空间小），用 sub-Frame 容纳
+        # 两个按钮各自 pack(side=tk.TOP)。Example Input 在上、Clear SNP Input 在
+        # 下——加载在前、清空在后，匹配阅读顺序。布局：
+        #   [ Text ............... | Example Input  ]
+        #   [                      | Clear SNP Input]
+        snp_button_col = ttk.Frame(input_frame)
+        snp_button_col.pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(
+            snp_button_col, text="Example Input", command=self.load_example_snp_input
+        ).pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+        ttk.Button(
+            snp_button_col, text="Clear SNP Input", command=self.clear_snp_input
+        ).pack(side=tk.TOP, fill=tk.X)
         self.snp_text = tk.Text(input_frame, height=5, wrap=tk.WORD, font=self._mono_font)
-        self.snp_text.pack(fill=tk.X, expand=False)
-        self.snp_text.insert(
-            "1.0",
-            (
-                "IWB50236,7A,cctcctcgtttcaaaagaagtaactcatcaaatgattcaaaaatatcgat[A/G]CTTGGCTGGTGTATCGTGCAGACGACAGTTCGTCCGGTATCAACAGCATT\n"
-                "IWB58849,7A,ATGACAATCAGAGCATGGAAGAAGACTTCGAGAAAGGAACCGCGCCCAAG[T/C]GGTTTTGCTACAGCGACTTGGCCATGGCCACCGACAACTTTTCCGACGAT\n"
-            ),
-        )
+        self.snp_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.snp_text.insert("1.0", self._EXAMPLE_SNP_INPUT)
 
         actions = ttk.Frame(outer)
         actions.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(actions, text="Export FASTA", command=self.export_fasta).pack(side=tk.LEFT)
         ttk.Button(actions, text="Show Run Plan", command=self.show_plan).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Run Pipeline", command=self.run_pipeline).pack(side=tk.LEFT)
+        # Stop Pipeline 按钮跑流程时才可点。__init__ 留了 self.stop_button
+        # 占位，这里赋值。第七轮把标签从 "Stop" 改成 "Stop Pipeline"，跟
+        # "Run Pipeline" 对称、含义更明确。
+        self.stop_button = ttk.Button(
+            actions, text="Stop Pipeline", command=self.cancel_pipeline, state="disabled"
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT)
         # 状态条用 tk.Label（ttk.Label 给 foreground 上色受 theme 干扰），加粗大字
         # + 颜色区分：Idle 灰、Running 橙、Completed 绿、Failed 红。
@@ -282,13 +383,13 @@ class DesktopApp:
         selected = filedialog.askopenfilename(
             title="Choose BLAST DB index file",
             filetypes=[
-                ("BLAST DB", "*.nin *.nsq *.nhr *.ndb *.nos *.nog"),
+                ("BLAST DB", "*.nal *.nin *.nsq *.nhr *.ndb *.nos *.nog"),
                 ("All files", "*.*"),
             ],
         )
         if selected:
             path = Path(selected)
-            if path.suffix.lower() in {".nin", ".nsq", ".nhr", ".ndb", ".nos", ".nog"}:
+            if path.suffix.lower() in {".nal", ".nin", ".nsq", ".nhr", ".ndb", ".nos", ".nog"}:
                 self.local_blast_db_var.set(str(path.with_suffix("")))
             else:
                 self.local_blast_db_var.set(str(path))
@@ -305,6 +406,21 @@ class DesktopApp:
 
     def clear_log(self) -> None:
         self.log_text.delete("1.0", tk.END)
+
+    def clear_snp_input(self) -> None:
+        self.snp_text.delete("1.0", tk.END)
+
+    def load_example_snp_input(self) -> None:
+        # 「替换」语义：先清空再填，避免追加到用户半截编辑过的行后面破坏 polymarker
+        # 格式。和启动预填用同一个 _EXAMPLE_SNP_INPUT 常量。
+        self.snp_text.delete("1.0", tk.END)
+        self.snp_text.insert("1.0", self._EXAMPLE_SNP_INPUT)
+
+    def reset_params(self) -> None:
+        for name, value in self._param_defaults.items():
+            getattr(self, name).set(value)
+        self._refresh_mode_fields()
+        self.log("已重置所有参数为默认值")
 
     def log(self, message: str) -> None:
         self.log_text.insert(tk.END, f"{message}\n")
@@ -342,6 +458,7 @@ class DesktopApp:
         "Running": "#d97706",    # 橙
         "Completed": "#16a34a",  # 绿
         "Failed": "#dc2626",     # 红
+        "Cancelled": "#dd8800",  # 橙黄（介于 Running 橙和 Failed 红之间）
     }
 
     def _set_status(self, state: str) -> None:
@@ -393,6 +510,8 @@ class DesktopApp:
                 self._handle_run_complete(payload)
             elif event_type == "error":
                 self._handle_run_error(str(payload))
+            elif event_type == "cancelled":
+                self._handle_run_cancelled(str(payload))
         self.root.after(100, self._drain_ui_queue)
 
     def export_fasta(self) -> None:
@@ -437,13 +556,6 @@ class DesktopApp:
         mode = self.mode_var.get()
         reference_fasta = Path(self.reference_path_var.get()) if self.reference_path_var.get().strip() else None
         local_db = Path(self.local_blast_db_var.get()) if self.local_blast_db_var.get().strip() else None
-        if reference_fasta and local_db:
-            raise ValueError(
-                "Reference FASTA 和 Local BLAST DB 不能同时填——\n"
-                "二选一：要么给 raw FASTA 让程序自动 makeblastdb 建库，"
-                "要么给已经建好的 BLAST DB prefix。\n"
-                "如果只想用其中一个，把另一个字段清空。"
-            )
         blast_mode = "local"
         remote_provider = None
         remote_fetch_database = None
@@ -453,6 +565,33 @@ class DesktopApp:
             blast_mode = "provider_online"
             remote_provider = self.remote_provider_var.get().strip() or "ebi"
             remote_fetch_database = self.remote_fetch_database_var.get().strip() or None
+        if blast_mode == "local":
+            # local 模式互斥校验 + 必填 —— 任何一个都没填会让 core.pipeline 直接撞
+            # "非 fixture 模式必须给 reference_db"，提前在这里给一个能动手的错误。
+            if reference_fasta and local_db:
+                raise ValueError(
+                    "Reference FASTA 和 Local BLAST DB 不能同时填——\n"
+                    "二选一：要么给 raw FASTA 让程序自动 makeblastdb 建库，"
+                    "要么给已经建好的 BLAST DB prefix。\n"
+                    "如果只想用其中一个，把另一个字段清空。"
+                )
+            if not reference_fasta and not local_db:
+                raise ValueError(
+                    "Local BLAST 模式必须填 Reference FASTA 或 Local BLAST DB 其中之一。"
+                )
+        else:
+            # online 模式忽略两个本地字段（即便残留旧值）；核心 pipeline 会再校验
+            # remote_database。
+            reference_fasta = None
+            local_db = None
+            if not self.remote_database_var.get().strip():
+                raise ValueError(
+                    f"在线 BLAST 模式（{mode}）必须填 Online database。"
+                )
+            if blast_mode == "provider_online" and not self.remote_email_var.get().strip():
+                raise ValueError(
+                    "EBI BLAST 必须填 Contact email（EBI 服务条款要求）。"
+                )
 
         return PipelineRequest(
             input_csv=input_path,
@@ -515,12 +654,42 @@ class DesktopApp:
         self.kasp_text.delete("1.0", tk.END)
         self.caps_text.delete("1.0", tk.END)
         self.log("Starting pipeline run")
+        # 每次 run 在用户选的 Working dir 下建一个 run_<ts> 子目录跑流程，跨 run
+        # 不再互相覆盖中间产物 / 结果。working_dir_var 不动，下次 GUI 看到的
+        # 还是用户原始填的根目录。
+        base_workdir = Path(self.working_dir_var.get())
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_workdir = base_workdir / f"run_{timestamp}"
+        try:
+            run_workdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(
+                "Run Error",
+                f"无法创建本次 run 的工作目录 {run_workdir}：{exc}",
+            )
+            self._set_status("Failed")
+            return
+        self.log(f"本次 run 输出目录：{run_workdir}")
+        # 协作式取消：clear cancel_event；Stop 按钮启用。
+        self.cancel_event.clear()
+        if self.stop_button is not None:
+            self.stop_button.configure(state="normal")
         self.run_thread = threading.Thread(
             target=self._run_pipeline_worker,
-            args=(request, binaries, Path(self.working_dir_var.get())),
+            args=(request, binaries, run_workdir),
             daemon=True,
         )
         self.run_thread.start()
+
+    def cancel_pipeline(self) -> None:
+        """Stop 按钮回调：set cancel_event。worker 线程会在下一个 step 边界 /
+        在线 polling 周期检测到并 raise PipelineCancelled，回到 GUI 后状态切到
+        Cancelled。Stop 按钮不立刻 disable 是因为想让用户看到 "你已经按过了"，
+        实际 disable 由 _handle_run_cancelled / _handle_run_complete /
+        _handle_run_error 做。"""
+        if self.run_thread and self.run_thread.is_alive():
+            self.cancel_event.set()
+            self.log("已发送取消信号——pipeline 会在当前 step 边界 / 在线 polling 周期停下。")
 
     def _run_pipeline_worker(
         self,
@@ -528,19 +697,28 @@ class DesktopApp:
         binaries: BinaryBundle,
         working_dir: Path,
     ) -> None:
+        # 延迟 import：避免模块顶端 import core.pipeline 触发 Layer A 的 standalone
+        # 测试期望。这里 worker 已经在 PipelineRunner.run() 上下文里，core 早已加载。
+        from core.pipeline import PipelineCancelled
         try:
             result = PipelineRunner(
                 request=request,
                 binaries=binaries,
                 working_dir=working_dir,
                 logger=self._queue_log,
+                cancel_event=self.cancel_event,
             ).run()
+        except PipelineCancelled as exc:
+            self.ui_queue.put(("cancelled", str(exc)))
+            return
         except Exception as exc:
             self.ui_queue.put(("error", str(exc)))
             return
         self.ui_queue.put(("complete", result))
 
     def _handle_run_complete(self, result) -> None:
+        if self.stop_button is not None:
+            self.stop_button.configure(state="disabled")
         self._set_status("Completed")
         summary = {
             "working_dir": str(result.working_dir),
@@ -564,10 +742,18 @@ class DesktopApp:
         self.log("Pipeline completed")
 
     def _handle_run_error(self, message: str) -> None:
+        if self.stop_button is not None:
+            self.stop_button.configure(state="disabled")
         self._set_status("Failed")
         self.log(message)
         full = f"{message}\n\n完整日志见: {self._log_path}"
         messagebox.showerror("Pipeline Failed", full)
+
+    def _handle_run_cancelled(self, message: str) -> None:
+        if self.stop_button is not None:
+            self.stop_button.configure(state="disabled")
+        self._set_status("Cancelled")
+        self.log(f"Pipeline cancelled: {message}")
 
     def _render_kasp_blast_placeholder(self) -> None:
         """KASP Primer BLAST tab 默认 placeholder（pipeline 还没跑 / 没勾 Blast primers

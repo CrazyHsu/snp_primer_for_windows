@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -37,11 +38,13 @@ class PipelineRunner:
         working_dir: str | Path,
         *,
         logger: LogFn | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.request = request
         self.binaries = binaries
         self.working_dir = Path(working_dir)
         self.logger = logger
+        self.cancel_event = cancel_event
 
     def run(self) -> PipelineRunResult:
         self.working_dir.mkdir(parents=True, exist_ok=True)
@@ -57,23 +60,24 @@ class PipelineRunner:
         reference_db = str(self.request.local_blast_db) if self.request.local_blast_db else None
         reference_fasta = str(self.request.reference_fasta) if self.request.reference_fasta else None
 
-        # 仅支持 local 模式（远端 BLAST 暂未对齐到 core.pipeline，
-        # 标准结果 wheatomics 也是 local 跑的）。
-        if self.request.blast_mode != "local":
-            log_message(
-                self.logger,
-                f"目前只接入了 local BLAST 模式（请求：{self.request.blast_mode}）"
-                f"，将按 local 处理。如需远端 BLAST 请用 v4 流程。",
-            )
-
         def _log(msg):
             log_message(self.logger, str(msg))
+
+        # v10: blast_mode 真接入了。"local" 走 blastn + blastdbcmd（v9 行为不变）；
+        # "ncbi_online" / "provider_online" 走 src/snp_primer_app/online_blast.py
+        # 的 NCBI / EBI HTTP 客户端。在线模式忽略 reference_db / reference_fasta。
+        log_message(self.logger, f"BLAST 模式：{self.request.blast_mode}")
 
         result = core_pipeline.run(
             input_csv=self.request.input_csv,
             workdir=self.working_dir,
             reference_db=reference_db,
             reference_fasta=reference_fasta,
+            blast_mode=self.request.blast_mode,
+            remote_provider=self.request.remote_provider,
+            remote_database=self.request.remote_database,
+            remote_fetch_database=self.request.remote_fetch_database,
+            remote_email=self.request.remote_email,
             ploidy=int(self.request.ploidy),
             max_price=int(self.request.max_enzyme_price),
             design_caps=bool(self.request.design_caps),
@@ -83,6 +87,7 @@ class PipelineRunner:
             pick_anyway=1 if self.request.pick_anyway else 0,
             do_primer_blast=bool(self.request.blast_primers),
             bin_dir=str(bin_dir),
+            cancel_event=self.cancel_event,
             log=_log,
         )
 

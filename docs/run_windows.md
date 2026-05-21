@@ -15,9 +15,8 @@ That launcher will:
 - install everything into `snp_primer_runtime\`
 - create a private virtual environment
 - install this app
-- install `primer3-py`
-- download BLAST+ for Windows
-- download the latest Windows MUSCLE build
+- copy the bundled BLAST+, primer3, and MUSCLE binaries
+- download and extract a private Python 3.11 runtime only if the machine does not already have Python 3.11+
 - launch the desktop UI
 
 All downloaded files now stay inside the project directory:
@@ -76,7 +75,7 @@ Notes:
 - `muscle.exe` can be taken from the Windows release assets of `rcedgar/muscle`: `https://github.com/rcedgar/muscle/releases`
 - `primer3_core.exe` can be built on Windows as documented by Primer3: `https://primer3.org/manual.html#installWindows`
 - `primer3_config/` must be present for thermodynamic parameters. The safest setup is to place that folder next to `primer3_core.exe`.
-- If you use the automatic bootstrap launcher, the app can also run through `primer3-py` and does not require `primer3_core.exe`.
+- If you use the automatic bootstrap launcher, `primer3_core.exe` is copied from `windows\bin` automatically.
 
 If you do not want to put `primer3_config` inside `bin`, set:
 

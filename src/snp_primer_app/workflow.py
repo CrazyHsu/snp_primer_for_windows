@@ -46,7 +46,7 @@ def build_pipeline_plan(
             ]
         )
     elif request.blast_mode == "ncbi_online":
-        steps.append(["NCBI BLAST URL API", request.remote_database or "nt", str(blast_output)])
+        steps.append(["NCBI BLAST URL API", request.remote_database or "core_nt", str(blast_output)])
     else:
         steps.append(
             [

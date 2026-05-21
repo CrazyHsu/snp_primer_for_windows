@@ -90,16 +90,22 @@ bootloader 的 SxS activation context 通过 `CreateProcess` 继承到 NCBI .exe
 
 ## 故障排查
 
-**双击 cmd 后窗口一闪而过 / 反复报 `Python installer failed with exit code 1392`**
+**双击 cmd 后窗口一闪而过 / Python 下载或解压失败**
 
-第一次启动时下载 Python installer 被网络层中断（杀软 HTTPS 拦截、公司代理、网络抖动都可能），
-残留了半成品文件。删了再重试：
+v10 不再运行 Python `.exe` 安装器，而是下载官方
+`python-3.11.9-amd64.zip`，校验 SHA256 后解压到
+`snp_primer_runtime\python311`。如果网络层中断、杀软/代理篡改下载，日志里可能看到
+`Downloaded ... failed validation`、`SHA256 mismatch` 或
+`Failed to extract Python runtime archive`。删掉缓存 zip 后重试：
 ```
-del "%cd%\snp_primer_runtime\downloads\python-3.11.9-amd64.exe"
+del "%cd%\snp_primer_runtime\downloads\python-3.11.9-amd64.zip"
 ```
 然后再次双击 `Launch SNP Primer Desktop.cmd`。如果网络仍持续被掐，先关本机杀软的
-HTTPS 拦截 / 换网络，或在系统上手动装 Python 3.11+——bootstrap 会自动检测系统 Python
-并跳过下载。
+HTTPS 拦截 / 换网络，或在系统上手动装 Python 3.11+——bootstrap 会自动检测系统
+Python 并跳过下载。
+
+如果 v9 日志里反复出现 `Python installer failed with exit code 5` 或 `1392`，
+请直接换 v10；这是 v9 仍依赖 `.exe` 安装器导致的失败面。
 
 **`bootstrap.log` 里看到 `Download failed: ...`**
 

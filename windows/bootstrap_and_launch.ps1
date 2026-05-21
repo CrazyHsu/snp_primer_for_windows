@@ -20,7 +20,8 @@ $ReferenceRoot = Join-Path $AppDataRoot "references"
 $DownloadsRoot = Join-Path $AppDataRoot "downloads"
 $TempRoot = Join-Path $AppDataRoot "tmp"
 $BootstrapLog = Join-Path $AppDataRoot "bootstrap.log"
-$PythonInstallerUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+$PythonArchiveUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.zip"
+$PythonArchiveSha256 = "4ba90a4ab8990891033d37ff04d2047fdae8948d0d2729a68d3a6a17c585b681"
 $BlastTarUrl = "https://ftp.ncbi.nlm.nih.gov/blast/executables/LATEST/ncbi-blast-2.17.0+-x64-win64.tar.gz"
 
 function Write-Status {
@@ -35,6 +36,43 @@ function Ensure-Directory {
     }
 }
 
+function Test-DownloadedFile {
+    param(
+        [string]$Path,
+        [int]$MinBytes = 0,
+        [string]$Sha256 = "",
+        [string]$Context = "File"
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    if ($MinBytes -gt 0) {
+        try {
+            $sz = (Get-Item -LiteralPath $Path).Length
+        } catch {
+            Write-Status "$Context $Path could not be inspected; re-downloading"
+            return $false
+        }
+        if ($sz -lt $MinBytes) {
+            Write-Status "$Context $Path is $sz bytes (< $MinBytes expected); re-downloading"
+            return $false
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Sha256)) {
+        try {
+            $ActualSha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        } catch {
+            Write-Status "$Context $Path could not be hashed; re-downloading"
+            return $false
+        }
+        if ($ActualSha256 -ne $Sha256.ToLowerInvariant()) {
+            Write-Status "$Context $Path SHA256 mismatch; re-downloading"
+            return $false
+        }
+    }
+    return $true
+}
+
 function Invoke-Download {
     # Robust download with crash-safe semantics:
     #  - Writes to a .partial sidecar; renames to OutFile only on full success.
@@ -42,24 +80,20 @@ function Invoke-Download {
     #    re-downloads from scratch and does NOT reuse a corrupt cached file.
     #  - Optional -MinBytes catches truncated downloads that did NOT raise an
     #    HTTP error (antivirus / proxy mid-stream cuts).
-    # Guards against the Python-installer 1392 ERROR_FILE_CORRUPT loop. See
-    # CLAUDE.md section 6.10 for the bug history.
+    #  - Optional -Sha256 catches full-size but modified/corrupt cached files.
+    # Guards against corrupt Python runtime downloads. See CLAUDE.md section
+    # 6.10 for the bug history.
     param(
         [string]$Url,
         [string]$OutFile,
-        [int]$MinBytes = 0
+        [int]$MinBytes = 0,
+        [string]$Sha256 = ""
     )
     if (Test-Path -LiteralPath $OutFile) {
-        if ($MinBytes -gt 0) {
-            $sz = (Get-Item -LiteralPath $OutFile).Length
-            if ($sz -lt $MinBytes) {
-                Write-Status "Cached $OutFile is $sz bytes (< $MinBytes expected); re-downloading"
-                Remove-Item -LiteralPath $OutFile -Force
-            } else {
-                return
-            }
-        } else {
+        if (Test-DownloadedFile -Path $OutFile -MinBytes $MinBytes -Sha256 $Sha256 -Context "Cached") {
             return
+        } else {
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
         }
     }
     Write-Status "Downloading $Url"
@@ -77,13 +111,10 @@ function Invoke-Download {
                ". If this is a network / antivirus problem, fix the network and re-run. " + `
                "Or manually place the file at: " + $OutFile)
     }
-    if ($MinBytes -gt 0) {
-        $sz = (Get-Item -LiteralPath $Partial).Length
-        if ($sz -lt $MinBytes) {
-            Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
-            throw ("Downloaded $Url is only $sz bytes (< $MinBytes expected). " + `
-                   "Connection was likely truncated by antivirus / proxy. Re-run to retry.")
-        }
+    if (-not (Test-DownloadedFile -Path $Partial -MinBytes $MinBytes -Sha256 $Sha256 -Context "Downloaded")) {
+        Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
+        throw ("Downloaded $Url failed validation. Connection may have been " + `
+               "truncated or modified by antivirus / proxy. Re-run to retry.")
     }
     Move-Item -LiteralPath $Partial -Destination $OutFile -Force
 }
@@ -132,6 +163,27 @@ function Get-ExistingPython {
     return $null
 }
 
+function Test-PythonRuntime {
+    param(
+        [string]$PythonExe,
+        [string]$Context
+    )
+    if (-not (Test-Path -LiteralPath $PythonExe)) {
+        return $false
+    }
+    try {
+        $Probe = "import sys, venv, ensurepip, tkinter; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        $null = & $PythonExe "-c" $Probe 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+        Write-Status "$Context failed Python runtime probe (exit=$LASTEXITCODE)"
+    } catch {
+        Write-Status "$Context could not run Python runtime probe"
+    }
+    return $false
+}
+
 function Ensure-LocalPython {
     $ExistingPython = Get-ExistingPython
     if ($ExistingPython) {
@@ -141,45 +193,62 @@ function Ensure-LocalPython {
 
     $PythonExe = Join-Path $PythonRoot "python.exe"
     if (Test-Path -LiteralPath $PythonExe) {
-        return $PythonExe
+        if (Test-PythonRuntime -PythonExe $PythonExe -Context "Existing local Python") {
+            return $PythonExe
+        }
+        Write-Status "Existing local Python runtime is broken; rebuilding"
+        Remove-Item -LiteralPath $PythonRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     Ensure-Directory (Split-Path -Parent $PythonRoot)
     Ensure-Directory $DownloadsRoot
-    $Installer = Join-Path $DownloadsRoot "python-3.11.9-amd64.exe"
-    # python-3.11.9-amd64.exe is ~26 MB; refuse anything under 20 MB as truncated
-    Invoke-Download -Url $PythonInstallerUrl -OutFile $Installer -MinBytes 20000000
-    Write-Status "Installing local Python runtime"
-    $InstallProcess = Start-Process -FilePath $Installer -ArgumentList @(
-        "/passive",
-        "InstallAllUsers=0",
-        "TargetDir=$PythonRoot",
-        "Include_exe=1",
-        "Include_lib=1",
-        "Include_dev=1",
-        "Include_pip=1",
-        "Include_tcltk=1",
-        "Include_launcher=0",
-        "InstallLauncherAllUsers=0",
-        "AssociateFiles=0",
-        "Shortcuts=0",
-        "PrependPath=0",
-        "AppendPath=0",
-        "Include_test=0",
-        "CompileAll=0",
-        "SimpleInstall=0"
-    ) -Wait -PassThru
-    if ($InstallProcess.ExitCode -ne 0) {
-        # Delete the installer so the next run re-downloads from scratch instead
-        # of looping on a possibly-corrupt cached file (exit code 1392 =
-        # ERROR_FILE_CORRUPT). The .partial guard in Invoke-Download should
-        # prevent this in practice, but this is a second line of defense.
-        Write-Status "Python installer exited $($InstallProcess.ExitCode); removing $Installer so next run re-downloads"
-        Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
-        throw "Python installer failed with exit code $($InstallProcess.ExitCode) (1392 = ERROR_FILE_CORRUPT; installer cleared so next run re-downloads)"
+    Ensure-Directory $TempRoot
+    $Archive = Join-Path $DownloadsRoot "python-3.11.9-amd64.zip"
+    # python-3.11.9-amd64.zip is ~32 MB; refuse anything under 30 MB as truncated.
+    Invoke-Download -Url $PythonArchiveUrl -OutFile $Archive -MinBytes 30000000 -Sha256 $PythonArchiveSha256
+
+    $ExtractRoot = Join-Path $TempRoot "python311_extract"
+    if (Test-Path -LiteralPath $ExtractRoot) {
+        Remove-Item -LiteralPath $ExtractRoot -Recurse -Force
     }
-    if (-not (Test-Path -LiteralPath $PythonExe)) {
-        throw "Failed to install Python runtime into $PythonRoot"
+    Ensure-Directory $ExtractRoot
+    Write-Status "Extracting local Python runtime"
+    try {
+        Expand-Archive -LiteralPath $Archive -DestinationPath $ExtractRoot -Force
+    } catch {
+        Remove-Item -LiteralPath $ExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        throw ("Failed to extract Python runtime archive: " + $_.Exception.Message)
+    }
+
+    $StagedPython = Join-Path $ExtractRoot "python.exe"
+    $StagedRoot = $ExtractRoot
+    if (-not (Test-Path -LiteralPath $StagedPython)) {
+        $FoundPython = Get-ChildItem -Path $ExtractRoot -Filter "python.exe" -Recurse | Select-Object -First 1
+        if (-not $FoundPython) {
+            Remove-Item -LiteralPath $ExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+            throw "Python runtime archive did not contain python.exe"
+        }
+        $StagedPython = $FoundPython.FullName
+        $StagedRoot = Split-Path -Parent $StagedPython
+    }
+    if (-not (Test-PythonRuntime -PythonExe $StagedPython -Context "Staged local Python")) {
+        Remove-Item -LiteralPath $ExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        throw "Extracted Python runtime failed validation"
+    }
+
+    if (Test-Path -LiteralPath $PythonRoot) {
+        Remove-Item -LiteralPath $PythonRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $PythonRoot) {
+        Remove-Item -LiteralPath $ExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        throw "Could not remove old Python runtime at $PythonRoot"
+    }
+    Move-Item -LiteralPath $StagedRoot -Destination $PythonRoot -Force
+    if (Test-Path -LiteralPath $ExtractRoot) {
+        Remove-Item -LiteralPath $ExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-PythonRuntime -PythonExe $PythonExe -Context "Installed local Python")) {
+        throw "Failed to prepare Python runtime into $PythonRoot"
     }
     return $PythonExe
 }

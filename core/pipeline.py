@@ -29,6 +29,16 @@ from . import getkasp3
 HERE = Path(__file__).resolve().parent
 ASSETS_DIR = HERE / "assets"
 BLASTDB_PARSE_SEQID_SUFFIXES = (".nos", ".nog", ".nsi", ".nsd", ".nhd", ".nhi")
+
+
+class PipelineCancelled(RuntimeError):
+    """用户通过 GUI 的 Stop 按钮取消 pipeline 时抛出。
+
+    定义在 core/pipeline.py 顶部（不在 online_blast.py），是因为 online_blast 在
+    src/snp_primer_app/ 下；core/ 是更底层的层，让 online_blast 反向 import
+    PipelineCancelled 才不会破坏 Layer A 测试的 standalone-importable 性质
+    （CLAUDE.md §5）。
+    """
 BLASTDB_FILE_SUFFIXES = (
     ".nhr", ".nin", ".nsq", ".nog", ".nsd", ".nsi", ".nos",
     ".ndb", ".not", ".ntf", ".nto", ".nhd", ".nhi", ".nal",
@@ -209,26 +219,102 @@ def _blast_safe_db_path(p, fallback_dir=None):
     )
 
 
+def _blastdb_volume_prefixes(db_prefix):
+    """如果 db_prefix 是多卷库，返回每个 volume 的 prefix list；否则返回 []。
+
+    优先级：
+    1. ``<db_prefix>.nal`` 存在 → 读 DBLIST，按空格 split。相对路径相对 .nal
+       所在目录解析。BLAST 自己也是按空格 split DBLIST（见 §6.7），所以这里
+       不用处理 quote。
+    2. parent-scan 找 ``<stem>.<NN>.nhr``（NN 是 ≥2 位数字，与
+       ``_ensure_blastdb_alias_for_volumes`` 一致）。
+
+    任何 I/O / 解析错误都返回 []，让上层走原 prefix-only 路径并最终给出已有的
+    错误信息。
+    """
+    db_prefix = os.fspath(db_prefix)
+    nal_path = db_prefix + ".nal"
+    if os.path.isfile(nal_path):
+        try:
+            nal_dir = Path(nal_path).parent
+            with open(nal_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    parts = stripped.split()
+                    if not parts or parts[0].upper() != "DBLIST":
+                        continue
+                    volumes = []
+                    for part in parts[1:]:
+                        vp = Path(part)
+                        if not vp.is_absolute():
+                            vp = nal_dir / vp
+                        volumes.append(str(vp))
+                    if volumes:
+                        return volumes
+        except OSError:
+            pass
+    parent = Path(db_prefix).parent
+    stem = Path(db_prefix).name
+    if parent.is_dir() and stem:
+        pattern = re.compile(re.escape(stem) + r"\.(\d{2,})$")
+        scanned = sorted({
+            str(parent / f.stem) for f in parent.glob(stem + ".*.nhr")
+            if pattern.match(f.stem)
+        })
+        if scanned:
+            return scanned
+    return []
+
+
+def _blastdb_has_parse_seqids(db_prefix):
+    """库是否用 -parse_seqids 建过。
+
+    单卷库：prefix 上直接出现 ``.nos/.nog/.nsi/.nsd/.nhd/.nhi`` 任一即通过。
+    多卷库（``.nal`` alias，或 ``<stem>.NN.nhr`` 这种切片）：**每个 volume**
+    都要有自己的 parse_seqids 索引文件。要求 *all* 而不是 *any*——blastdbcmd
+    的 OID 空间跨所有 volume，哪怕一个 volume 缺索引，落在那里的 accession
+    都反查不出来；``makeblastdb -parse_seqids`` 实际产出也是要么都有要么都没
+    有，all 是正确口径。
+    """
+    db_prefix = os.fspath(db_prefix)
+    if any(os.path.isfile(db_prefix + suf) for suf in BLASTDB_PARSE_SEQID_SUFFIXES):
+        return True
+    volume_prefixes = _blastdb_volume_prefixes(db_prefix)
+    if not volume_prefixes:
+        return False
+    return all(
+        any(os.path.isfile(vp + suf) for suf in BLASTDB_PARSE_SEQID_SUFFIXES)
+        for vp in volume_prefixes
+    )
+
+
 def _check_blastdb_has_parse_seqids(db_prefix):
-    """检查 BLAST DB 是不是用 -parse_seqids 建过。
+    """检查 BLAST DB 是不是用 -parse_seqids 建过；否则抛带修复指引的错误。
 
     没用 -parse_seqids 建的库只有 ``.nhr/.nin/.nsq``（外加新版 BLAST+ 的
     ``.ndb/.not/.ntf/.nto``）。要让 blastdbcmd 能按 accession 反查，必须有
     accession→OID 的索引文件——老版叫 ``.nsi``/``.nsd``/``.nog``，新版统一在
-    ``.nos`` 里。这里只要这几个里有任意一个存在就当通过；都没有就抛错。
+    ``.nos`` 里。
+
+    多卷库（用户给的是带 .nal alias 的 prefix，或 makeblastdb 自动切片后的
+    多卷库）这些索引文件在 ``<stem>.NN.nog/.nsd/.nsi`` 上而不是 prefix 上；
+    见 ``_blastdb_has_parse_seqids`` / ``_blastdb_volume_prefixes``。
 
     db_prefix 可能是绝对路径（比如经过 _blast_safe_db_path() junction 之后的
-    路径），也可能是带空格短名。检查时按 prefix + 后缀直接 stat。
+    路径），也可能是带空格短名。
     """
-    db_prefix = os.fspath(db_prefix)
-    if any(os.path.isfile(db_prefix + suf) for suf in BLASTDB_PARSE_SEQID_SUFFIXES):
+    if _blastdb_has_parse_seqids(db_prefix):
         return
-    # 没找到任何 parse_seqids 产物。报错给用户能动手的提示。
+    db_prefix = os.fspath(db_prefix)
     base_dir = os.path.dirname(db_prefix) or "."
     base_name = os.path.basename(db_prefix)
     raise RuntimeError(
         f"BLAST 库 {db_prefix} 看起来不是用 -parse_seqids 建的（没找到 "
         f".nos/.nog/.nsi/.nsd 任意一种 accession 索引文件）。\n\n"
+        f"多卷库（每个 volume 一个 .nhr）的索引在 <stem>.NN.nog/.nsd/.nsi 上而\n"
+        f"不是 prefix 上；如果每个 volume 都缺，说明 makeblastdb 没带 -parse_seqids。\n\n"
         f"blastdbcmd 必须靠这些索引按染色体名（如 Chr7A）反查序列；缺了它\n"
         f"流程会卡在 Step 5 之后产出空文件，再到 getkasp3 里抛 KeyError。\n\n"
         f"修复：到 {base_dir} 下，用原始 FASTA 重建一次：\n"
@@ -237,16 +323,114 @@ def _check_blastdb_has_parse_seqids(db_prefix):
     )
 
 
-def _blastdb_has_parse_seqids(db_prefix):
-    db_prefix = os.fspath(db_prefix)
-    return any(os.path.isfile(db_prefix + suf) for suf in BLASTDB_PARSE_SEQID_SUFFIXES)
-
-
 def _blastdb_has_core_files(db_prefix):
     db_prefix = os.fspath(db_prefix)
     old_style = all(os.path.isfile(db_prefix + suf) for suf in (".nhr", ".nin", ".nsq"))
     new_style = any(os.path.isfile(db_prefix + suf) for suf in (".ndb", ".nal"))
     return old_style or new_style
+
+
+def _ensure_blastdb_alias_for_volumes(db_prefix, workdir, log):
+    """如果 db_prefix 是多卷库 prefix 但缺 .nal alias，自动在 workdir 下生成一个。
+
+    背景：``makeblastdb`` 在输入 FASTA 超过 ``-max_file_sz`` 时会自动切片成
+    ``<prefix>.00.{nhr,nin,nsq,...}`` / ``<prefix>.01.{...}`` 等 volume，正常情况下
+    顺手生成 ``<prefix>.nal`` alias。但如果库是手动 / 旧版本工具建的，可能漏了 .nal——
+    此时 ``blastn -db <prefix>`` 会撞 "No alias or index file found"。
+
+    触发条件（按顺序）：
+
+    1. ``<prefix>.nhr`` 或 ``<prefix>.nal`` 任一存在 → 单卷库或已有 alias，原样返回
+    2. 扫描 parent，找形如 ``<stem>.<NN>.nhr`` 的 volume（NN 是 2+ 位数字）
+    3. 有 ≥1 个 volume → 写 ``<workdir>/blastdb_alias/<stem>.nal``，DBLIST 用
+       volume 的绝对路径前缀，返回 ``<workdir>/blastdb_alias/<stem>`` 作为新 prefix
+    4. 没有 volume → 原样返回，让 blastn 自己报 "No alias or index file" 错误
+
+    DBLIST 里 volume 路径不能含空格（BLAST 内部按空格 split DBLIST，见 §6.7）。
+    含空格时抛 RuntimeError 提示用户挪 DB / 自己 mklink junction。中文 / dot /
+    其他 unicode 字符 BLAST 处理 OK，不在此处过滤。
+
+    不写用户 DB 目录（可能只读 / NAS / 共享盘）；alias 完全 workdir-local，每次
+    跑都会被新建覆盖。
+    """
+    db_prefix = os.fspath(db_prefix)
+    if _blastdb_has_core_files(db_prefix):
+        return db_prefix
+    parent = Path(db_prefix).parent
+    stem = Path(db_prefix).name
+    if not parent.is_dir() or not stem:
+        return db_prefix
+    pattern = re.compile(re.escape(stem) + r"\.(\d{2,})$")
+    volume_stems = sorted({
+        f.stem for f in parent.glob(stem + ".*.nhr")
+        if pattern.match(f.stem)
+    })
+    if not volume_stems:
+        return db_prefix
+    # 校验每个 volume 都有完整的 .nhr/.nin/.nsq；不完整的剔掉
+    volume_stems = [
+        vol for vol in volume_stems
+        if _blastdb_has_core_files(str(parent / vol))
+    ]
+    if not volume_stems:
+        return db_prefix
+    abs_volumes = [str((parent / vol).resolve()) for vol in volume_stems]
+    spacey = [p for p in abs_volumes if " " in p]
+    if spacey:
+        raise RuntimeError(
+            f"多卷 BLAST 库 prefix {db_prefix} 缺 .nal alias；自动生成 alias 时\n"
+            f"发现 volume 绝对路径含空格（BLAST DBLIST 内部按空格 split，无法 quote）：\n"
+            + "\n".join(f"  {p}" for p in spacey) + "\n\n"
+            f"请把整个 {parent} 目录挪到无空格路径下，或手动 mklink /J 一个无空格的 junction 后重试。"
+        )
+    alias_dir = Path(workdir) / "blastdb_alias"
+    alias_dir.mkdir(parents=True, exist_ok=True)
+    nal_path = alias_dir / (stem + ".nal")
+    nal_text = (
+        "#\n"
+        "# Alias file auto-generated by snp_primer_app v11\n"
+        f"# Source DB lacked a .nal; volumes auto-collected from {parent}\n"
+        "#\n"
+        f"TITLE {stem}\n"
+        f"DBLIST {' '.join(abs_volumes)}\n"
+    )
+    nal_path.write_text(nal_text, encoding="ascii")
+    log(f"已为多卷 BLAST 库生成 alias：{nal_path}（{len(abs_volumes)} 个 volume）")
+    return str(alias_dir / stem)
+
+
+def _cleanup_stale_run_artifacts(workdir):
+    """删上一次 run 留在 workdir 的 alignment_raw_*.fa / All_alignment_raw.fa。
+
+    getkasp3.kasp() (line 482-488) 和 getCAPS.caps() (line 646-652) 都有
+    "alignment_raw_<snp>.fa 存在 + 非空就跳过 muscle" 的优化。但
+    ``get_fasta2`` 是按 *当前* flanking 文件的 hit 顺序给 sequence_name 加
+    ``-0/-1/...`` 后缀的，所以上次 run 的 alignment 字典 keys 跟这次 target
+    名字会对不上 → ``fasta[target]`` 抛 KeyError，详见 §6.15。
+
+    fixture 模式（``alignment_files=...``）在 ``run()`` 里下一步才把外部 alignment
+    文件拷进 workdir，所以这里无脑删不会破坏 fixture。
+
+    只动 alignment_raw_*.fa 和 All_alignment_raw.fa——其它 step 的中间文件
+    （temp_range / temp_marker / flanking / renamed / blast_out / primer3
+    output）每次都被写覆盖或者没有 skip-if-exists 复用，不会触发同类 bug。
+    """
+    if not workdir:
+        return
+    workdir = Path(workdir)
+    if not workdir.is_dir():
+        return
+    for stale in workdir.glob("alignment_raw_*.fa"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    all_align = workdir / "All_alignment_raw.fa"
+    if all_align.is_file():
+        try:
+            all_align.unlink()
+        except OSError:
+            pass
 
 
 def _first_fasta_seqid(fasta_path):
@@ -513,6 +697,12 @@ def run(*,
         flanking_files=None,
         alignment_files=None,
         bin_dir=None,
+        blast_mode="local",
+        remote_provider=None,
+        remote_database=None,
+        remote_fetch_database=None,
+        remote_email=None,
+        cancel_event=None,
         log=print):
     """
     跑完整 SNP 引物设计流程。
@@ -553,6 +743,17 @@ def run(*,
     bin_dir : str | Path | None
         primer3_core / muscle / blastn / blastdbcmd / makeblastdb 所在目录。
         留 None 则在 PATH 中找。
+    blast_mode : str
+        ``"local"`` (default) → 跑 blastn + blastdbcmd（v9 行为完全等价）。
+        ``"ncbi_online"`` → 通过 ``snp_primer_app.online_blast.run_ncbi_blast``
+        提交到 NCBI BLAST API；flanking 用 efetch 取。要求 ``remote_database``。
+        ``"provider_online"`` + ``remote_provider="ebi"`` → 通过
+        ``run_ebi_blast`` 提交到 EBI；flanking 用 dbfetch 取（需 ``remote_email``）。
+        online 模式下 ``reference_db`` / ``reference_fasta`` 会被忽略。
+    remote_provider, remote_database, remote_fetch_database, remote_email : str | None
+        online 模式参数。``remote_database`` 是 NCBI/EBI 上的库名（``core_nt`` /
+        ``refseq_genomes`` / ``em_rel``...）。``remote_fetch_database`` 仅 EBI
+        dbfetch 用（默认 ``ena_sequence``）。``remote_email`` NCBI 强烈建议、EBI 必填。
     log : callable
         每条进度信息的回调。
 
@@ -573,6 +774,29 @@ def run(*,
     # 把 bin_dir 注入到 getCAPS / getkasp3 那条 subprocess.call 链路的 PATH 上，
     # 它们 build 命令时用裸 ``blastn`` 而不是完整 .exe 路径（getkasp3.py:263）。
     _install_call_patch_with_bin_dir(bin_dir_str)
+
+    # 模式校验：online 模式直接忽略 reference_db / reference_fasta（GUI 不应该
+    # 同时给，但兜底用），下面 Step 2 / Step 5 走 online 分支不需要本地库。
+    _is_online = blast_mode in ("ncbi_online", "provider_online")
+    if _is_online:
+        if reference_fasta or reference_db:
+            log(f"在线 BLAST 模式（{blast_mode}）下忽略给定的 reference_db / reference_fasta")
+            reference_fasta = None
+            reference_db = None
+        if not remote_database:
+            raise ValueError(
+                f"在线 BLAST 模式 {blast_mode!r} 必须提供 remote_database（NCBI/EBI 库名）。"
+            )
+        if blast_mode == "provider_online":
+            if (remote_provider or "").lower() != "ebi":
+                raise ValueError(
+                    f"provider_online 目前只支持 remote_provider='ebi'，收到 {remote_provider!r}"
+                )
+            if not remote_email:
+                raise ValueError("EBI BLAST 必须填写 remote_email。")
+    elif blast_mode != "local":
+        raise ValueError(f"未知 blast_mode: {blast_mode!r}（应为 local / ncbi_online / provider_online）")
+
     # reference_fasta vs reference_db 二选一；同时给说明上层逻辑乱了。
     if reference_fasta and reference_db:
         raise ValueError(
@@ -586,6 +810,11 @@ def run(*,
             reference_fasta, workdir, bin_dir_str, log)
     if reference_db:
         reference_db = str(Path(reference_db).resolve())
+        # v11: 多卷库（makeblastdb 自动切片成 .00 / .01 / …）但缺 .nal alias 时，
+        # 自动在 workdir/blastdb_alias 下合成一个，把 reference_db 指向那里。
+        # 单卷库 / 已有 alias 的库会原样返回，行为不变。详见 §6.13。
+        reference_db = _ensure_blastdb_alias_for_volumes(
+            reference_db, workdir, log)
         # BLAST 的 -db 按空格 split（连 -out / blastdb_aliastool 也一样）。
         # 自动尝试：(1) 无空格透传 → (2) Windows 8.3 短名 → (3) workdir 里建 NTFS
         # junction，让 DB 文件出现在无空格路径下。最后失败才抛错给用户。
@@ -628,10 +857,22 @@ def run(*,
                            max_tm=max_tm, max_primer_size=max_size,
                            pick_anyway_=pick_anyway)
 
+    # 协作式取消检查（GUI Stop 按钮设 cancel_event；step 边界抽查）。
+    def _check_cancel(label: str) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise PipelineCancelled(f"用户在 {label} 阶段终止了 pipeline")
+
     # 切到工作目录工作（上游所有脚本都用相对路径 / cwd）
     saved_cwd = Path.cwd()
     try:
         os.chdir(workdir)
+
+        # v11 第三轮补丁：清掉上一次 run 留在 workdir 的 alignment_raw_*.fa /
+        # All_alignment_raw.fa。getkasp3 / getCAPS 看到 alignment_raw 存在就跳
+        # muscle，但 sequence_name 是按 *当前* flanking 的 hit 顺序加 -0/-1/...
+        # 后缀的，上次 run 的 hit 数不一样就会 KeyError（详见 §6.15）。fixture
+        # 模式的 alignment_files 在下面才拷入，sweep 不会破坏 fixture。
+        _cleanup_stale_run_artifacts(workdir)
 
         # 预先放标准 alignment_raw_*.fa（独立于 flanking_files 模式）
         if alignment_files is not None:
@@ -661,17 +902,50 @@ def run(*,
             _normalize_polymarker_input(src_csv, polymarker_csv_in_workdir)
 
             # Step 1: parse polymarker -> for_blast.fa
+            _check_cancel("Step 1")
             log("Step 1: 解析 polymarker 输入 -> for_blast.fa")
             parse_polymarker_input.parse(polymarker_csv_in_workdir,
                                          "for_blast.fa")
 
-            # Step 2: blastn (or fixture)
+            # Step 2: blastn (or fixture / online)
+            _check_cancel("Step 2")
             if blast_fixture:
                 log(f"Step 2: 复用 fixture BLAST 输出 {blast_fixture}")
                 src_b = blast_fixture
                 if not os.path.isabs(src_b):
                     src_b = str(saved_cwd / src_b)
                 shutil.copyfile(src_b, "blast_out.txt")
+            elif _is_online:
+                # v10 online 分支：HTTP 提交到 NCBI / EBI，把 15 列 blastn -outfmt 6
+                # 输出写到 blast_out.txt。subject_id 会被前缀为 "chr{XY}_" 以满足
+                # 下游 getflanking.flanking 的 ABD 过滤规则；Step 5 反解前缀拿原始
+                # accession 调 efetch / dbfetch。
+                from snp_primer_app.online_blast import (
+                    run_ncbi_blast,
+                    run_ebi_blast,
+                    render_alignment_table_with_chrom_prefix,
+                )
+                query_fasta = Path("for_blast.fa").read_text(encoding="utf-8")
+                log(f"Step 2: 在线 BLAST 模式={blast_mode} db={remote_database}")
+                if blast_mode == "ncbi_online":
+                    alignments = run_ncbi_blast(
+                        query_fasta,
+                        remote_database,
+                        logger=log,
+                        email=remote_email,
+                        cancel_event=cancel_event,
+                    )
+                else:  # provider_online → EBI（已在校验阶段限定）
+                    alignments = run_ebi_blast(
+                        query_fasta,
+                        remote_database,
+                        email=remote_email or "",
+                        logger=log,
+                        cancel_event=cancel_event,
+                    )
+                table = render_alignment_table_with_chrom_prefix(alignments, logger=log)
+                Path("blast_out.txt").write_text(table, encoding="utf-8")
+                log(f"Step 2 完成：写入 {len(table.splitlines())} 行 blast_out.txt")
             else:
                 if not blastn_bin:
                     raise RuntimeError("找不到 blastn，请通过 bin_dir 指向 BLAST+ "
@@ -698,6 +972,7 @@ def run(*,
                     )
 
             # Step 3: getflanking
+            _check_cancel("Step 3")
             log("Step 3: 解析 BLAST 结果，确定每个 marker 的 flanking 取范围")
             getflanking.flanking(polymarker_csv_in_workdir,
                                  "blast_out.txt",
@@ -718,51 +993,112 @@ def run(*,
                 }
 
             # Step 4: 把 temp_range.txt 拆成每个 marker 一个 temp_marker_*.txt
+            _check_cancel("Step 4")
             log("Step 4: 按 marker 拆分 temp_range.txt 并取 flanking 序列")
             _split_temp_range("temp_range.txt")
 
-            # Step 5: 用 blastdbcmd 取每个 marker 的 flanking 序列
-            if not blastdbcmd_bin:
-                raise RuntimeError("找不到 blastdbcmd，请提供 bin_dir")
-            if not reference_db:
-                raise RuntimeError("step 5 需要 reference_db 才能 blastdbcmd")
-            # 预检查 -parse_seqids：blastdbcmd 必须靠 parse_seqids 建出来的索引
-            # （.nos/.nog/.nsi 等）按 accession 取序列。如果用户建库时漏了
-            # -parse_seqids，blastdbcmd 会报 "OID not found" 然后产出 0 字节文件，
-            # 后面的 getkasp3 / getCAPS 会一路撞到莫名其妙的 KeyError。提前在这里
-            # 拦截，给一句能动手的错误。
-            _check_blastdb_has_parse_seqids(reference_db)
-            for marker_file in sorted(glob("temp_marker_*.txt")):
-                out_fa = "flanking_" + marker_file + ".fa"
-                cmd = [blastdbcmd_bin,
-                       "-entry_batch", marker_file,
-                       "-db", str(reference_db),
-                       "-out", out_fa]
-                r = _run(cmd, log)
-                # blastdbcmd 失败时（最常见：DB 没 -parse_seqids、accession 拼写不对）
-                # 必须立刻抛错，否则下游会拿空的 flanking 去喂 muscle / primer3，
-                # 在 getkasp3.py 里以 KeyError: '' 这种没头没尾的形式爆掉。
-                if r.returncode != 0 or Path(out_fa).stat().st_size == 0:
-                    out_log = (r.stdout or "").strip() or "(no output captured)"
-                    raise RuntimeError(
-                        f"blastdbcmd 取 flanking 失败 (returncode={r.returncode}, "
-                        f"db={reference_db}, entry_batch={marker_file})。"
-                        f"输出：\n{out_log}\n\n"
-                        f"最常见原因：BLAST 库建的时候没加 -parse_seqids，"
-                        f"blastdbcmd 没法按 accession (Chr7A 这种) 反查序列。"
-                        f"修复：用 makeblastdb -in <fasta> -dbtype nucl -parse_seqids "
-                        f"-out <prefix> 重建一次该库。"
-                    )
+            # Step 5: 用 blastdbcmd（local）或 efetch/dbfetch（online）取 flanking
+            _check_cancel("Step 5")
+            if _is_online:
+                from snp_primer_app.online_blast import (
+                    split_chrom_prefixed_subject,
+                    fetch_ncbi_sequence_for_range,
+                    fetch_ebi_sequence_for_range,
+                )
+                log("Step 5: 在线模式，按 temp_marker_*.txt 调 efetch / dbfetch 取 flanking")
+                for marker_file in sorted(glob("temp_marker_*.txt")):
+                    out_fa = "flanking_" + marker_file + ".fa"
+                    chunks: list[str] = []
+                    with open(marker_file, "r", encoding="utf-8") as fin:
+                        for line in fin:
+                            line = line.rstrip("\n")
+                            if not line:
+                                continue
+                            subject, rng, strand = line.split("\t")
+                            start_s, end_s = rng.split("-")
+                            start, end = int(start_s), int(end_s)
+                            # subject 形如 "chr7A_NC_057814.1"。拆出 ("7A", "NC_057814.1")。
+                            chrom_short, accession = split_chrom_prefixed_subject(subject)
+                            if chrom_short is None:
+                                # 不该发生：getflanking 已经按 chr 前缀过滤过
+                                log(f"WARN: {marker_file} 行 {line!r} 没有 chr 前缀；跳过")
+                                continue
+                            _check_cancel("Step 5 fetch")
+                            try:
+                                if blast_mode == "ncbi_online":
+                                    chunk = fetch_ncbi_sequence_for_range(
+                                        accession, start, end, strand,
+                                        header_id=subject,  # 保留 chr 前缀让下游 getCAPS 匹配
+                                        email=remote_email,
+                                        logger=log,
+                                        cancel_event=cancel_event,
+                                    )
+                                else:
+                                    chunk = fetch_ebi_sequence_for_range(
+                                        accession, start, end, strand,
+                                        fetch_database=(remote_fetch_database or "ena_sequence"),
+                                        header_id=subject,
+                                        logger=log,
+                                        cancel_event=cancel_event,
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                raise RuntimeError(
+                                    f"在线取 flanking 失败 (mode={blast_mode}, "
+                                    f"accession={accession}, range={start}-{end}, "
+                                    f"strand={strand})：{exc}"
+                                ) from exc
+                            chunks.append(chunk)
+                    Path(out_fa).write_text("".join(chunks), encoding="utf-8")
+                    if Path(out_fa).stat().st_size == 0:
+                        raise RuntimeError(
+                            f"在线取 flanking 后 {out_fa} 仍为空——"
+                            f"可能 NCBI/EBI 没返回任何可用序列。"
+                        )
+            else:
+                if not blastdbcmd_bin:
+                    raise RuntimeError("找不到 blastdbcmd，请提供 bin_dir")
+                if not reference_db:
+                    raise RuntimeError("step 5 需要 reference_db 才能 blastdbcmd")
+                # 预检查 -parse_seqids：blastdbcmd 必须靠 parse_seqids 建出来的索引
+                # （.nos/.nog/.nsi 等）按 accession 取序列。如果用户建库时漏了
+                # -parse_seqids，blastdbcmd 会报 "OID not found" 然后产出 0 字节文件，
+                # 后面的 getkasp3 / getCAPS 会一路撞到莫名其妙的 KeyError。提前在这里
+                # 拦截，给一句能动手的错误。
+                _check_blastdb_has_parse_seqids(reference_db)
+                for marker_file in sorted(glob("temp_marker_*.txt")):
+                    out_fa = "flanking_" + marker_file + ".fa"
+                    cmd = [blastdbcmd_bin,
+                           "-entry_batch", marker_file,
+                           "-db", str(reference_db),
+                           "-out", out_fa]
+                    r = _run(cmd, log)
+                    # blastdbcmd 失败时（最常见：DB 没 -parse_seqids、accession 拼写不对）
+                    # 必须立刻抛错，否则下游会拿空的 flanking 去喂 muscle / primer3，
+                    # 在 getkasp3.py 里以 KeyError: '' 这种没头没尾的形式爆掉。
+                    if r.returncode != 0 or Path(out_fa).stat().st_size == 0:
+                        out_log = (r.stdout or "").strip() or "(no output captured)"
+                        raise RuntimeError(
+                            f"blastdbcmd 取 flanking 失败 (returncode={r.returncode}, "
+                            f"db={reference_db}, entry_batch={marker_file})。"
+                            f"输出：\n{out_log}\n\n"
+                            f"最常见原因：BLAST 库建的时候没加 -parse_seqids，"
+                            f"blastdbcmd 没法按 accession (Chr7A 这种) 反查序列。"
+                            f"修复：用 makeblastdb -in <fasta> -dbtype nucl -parse_seqids "
+                            f"-out <prefix> 重建一次该库。"
+                        )
 
         # Step 6: 跑 KASP / CAPS
         if design_kasp:
+            _check_cancel("Step 6a")
             log("Step 6a: 跑 KASP 引物设计")
             getkasp3.kasp_main()
         if design_caps:
+            _check_cancel("Step 6b")
             log("Step 6b: 跑 CAPS / dCAPS 引物设计")
             getCAPS.caps_main()
 
         # Step 7: 拼接输出
+        _check_cancel("Step 7")
         log("Step 7: 拼接 Potential_*.tsv 与 All_alignment_raw.fa")
         if design_caps:
             _cat_files(sorted(glob("CAPS_output/selected_CAPS_primers*")),
