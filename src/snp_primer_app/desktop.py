@@ -88,6 +88,8 @@ class DesktopApp:
         self.remote_database_var = tk.StringVar(value="refseq_genomes")
         self.remote_fetch_database_var = tk.StringVar(value="ena_sequence")
         self.remote_email_var = tk.StringVar()
+        # v13: 物种 key，默认 wheat（=v12 字节等价）。详见 v13 CLAUDE.md §6.22。
+        self.species_var = tk.StringVar(value="wheat")
         self.ploidy_var = tk.StringVar(value="3")
         self.max_price_var = tk.StringVar(value="200")
         self.design_caps_var = tk.BooleanVar(value=True)
@@ -110,6 +112,7 @@ class DesktopApp:
             "remote_database_var": self.remote_database_var.get(),
             "remote_fetch_database_var": self.remote_fetch_database_var.get(),
             "remote_email_var": self.remote_email_var.get(),
+            "species_var": self.species_var.get(),  # v13
             "ploidy_var": self.ploidy_var.get(),
             "max_price_var": self.max_price_var.get(),
             "design_caps_var": self.design_caps_var.get(),
@@ -170,7 +173,29 @@ class DesktopApp:
         self.reference_path_var.trace_add("write", self._update_blast_input_lockout)
         self.local_blast_db_var.trace_add("write", self._update_blast_input_lockout)
 
-        ttk.Label(top, text="Online database").grid(row=3, column=0, sticky=tk.W, pady=4)
+        # v14: Species 移到 Online database 之上（行 3 → 行 4 整体下移）——
+        # Species 和 Online database 在概念上成对（决定查谁、查哪个库），按
+        # 阅读顺序自上而下排紧贴。详见 v14 §6.23。
+        # v13: Species 下拉。默认 wheat（=v12 字节等价）。选择会联动 ploidy 选项
+        # （wheat 1/2/3、其它 diploid 只剩 1）。详见 v13 CLAUDE.md §6.22。
+        ttk.Label(top, text="Species").grid(row=3, column=0, sticky=tk.W, pady=4)
+        from core.species import SPECIES_TABLE
+        self.species_combo = ttk.Combobox(
+            top,
+            textvariable=self.species_var,
+            values=list(SPECIES_TABLE.keys()),
+            state="readonly",
+        )
+        self.species_combo.grid(row=3, column=1, sticky=tk.EW, pady=4)
+        self.species_display_label = ttk.Label(
+            top,
+            text=SPECIES_TABLE["wheat"].display_name,
+            foreground="#666666",
+        )
+        self.species_display_label.grid(row=3, column=2, sticky=tk.W, padx=6, pady=4)
+        self.species_combo.bind("<<ComboboxSelected>>", self._on_species_changed)
+
+        ttk.Label(top, text="Online database").grid(row=4, column=0, sticky=tk.W, pady=4)
         # 顺序与 NCBI Web BLAST "Standard databases" 下拉完全一致（2026-05-21 抓
         # 的 HTML，21 个 value）。**不要再加旧 "nt"**——NCBI 当前下拉里没这个
         # value 了，传上去会被服务器静默 fallback 到 core_nt。
@@ -203,7 +228,7 @@ class DesktopApp:
                 "dbsts",
             ],
         )
-        self.remote_db_combo.grid(row=3, column=1, sticky=tk.EW, pady=4)
+        self.remote_db_combo.grid(row=4, column=1, sticky=tk.EW, pady=4)
         # 默认 normal-state Combobox 只在点小箭头时弹下拉，留作手输自定义 DB
         # 名仍可。点击 entry 部分也想弹——但不能用 event_generate("<Down>")：
         # key 事件按当前键盘焦点 deliver，widget-level Button-1 binding 触发时
@@ -220,46 +245,48 @@ class DesktopApp:
                 )
         self.remote_db_combo.bind("<Button-1>", _open_remote_db_dropdown)
 
-        ttk.Label(top, text="Other provider").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Label(top, text="Other provider").grid(row=5, column=0, sticky=tk.W, pady=4)
         self.remote_provider_combo = ttk.Combobox(
             top,
             textvariable=self.remote_provider_var,
             values=["ebi"],
             state="readonly",
         )
-        self.remote_provider_combo.grid(row=4, column=1, sticky=tk.EW, pady=4)
+        self.remote_provider_combo.grid(row=5, column=1, sticky=tk.EW, pady=4)
 
-        ttk.Label(top, text="Fetch database").grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Label(top, text="Fetch database").grid(row=6, column=0, sticky=tk.W, pady=4)
         self.remote_fetch_db_entry = ttk.Entry(top, textvariable=self.remote_fetch_database_var, width=90)
-        self.remote_fetch_db_entry.grid(row=5, column=1, sticky=tk.EW, pady=4)
+        self.remote_fetch_db_entry.grid(row=6, column=1, sticky=tk.EW, pady=4)
 
-        ttk.Label(top, text="Contact email").grid(row=6, column=0, sticky=tk.W, pady=4)
+        ttk.Label(top, text="Contact email").grid(row=7, column=0, sticky=tk.W, pady=4)
         self.remote_email_entry = ttk.Entry(top, textvariable=self.remote_email_var, width=90)
-        self.remote_email_entry.grid(row=6, column=1, sticky=tk.EW, pady=4)
+        self.remote_email_entry.grid(row=7, column=1, sticky=tk.EW, pady=4)
         ttk.Label(
             top,
             text="(NCBI recommended, EBI required)",
             foreground="#666666",
-        ).grid(row=6, column=2, sticky=tk.W, padx=6, pady=4)
+        ).grid(row=7, column=2, sticky=tk.W, padx=6, pady=4)
 
-        ttk.Label(top, text="Binary root").grid(row=7, column=0, sticky=tk.W, pady=4)
+        ttk.Label(top, text="Binary root").grid(row=8, column=0, sticky=tk.W, pady=4)
         self.binary_root_entry = ttk.Entry(top, textvariable=self.binary_root_var, width=90)
-        self.binary_root_entry.grid(row=7, column=1, sticky=tk.EW, pady=4)
+        self.binary_root_entry.grid(row=8, column=1, sticky=tk.EW, pady=4)
         self.binary_root_browse_button = ttk.Button(top, text="Browse", command=self.choose_binary_root)
-        self.binary_root_browse_button.grid(row=7, column=2, padx=6, pady=4)
+        self.binary_root_browse_button.grid(row=8, column=2, padx=6, pady=4)
 
-        ttk.Label(top, text="Working dir").grid(row=8, column=0, sticky=tk.W, pady=4)
-        ttk.Entry(top, textvariable=self.working_dir_var, width=90).grid(row=8, column=1, sticky=tk.EW, pady=4)
-        ttk.Button(top, text="Browse", command=self.choose_working_dir).grid(row=8, column=2, padx=6, pady=4)
+        ttk.Label(top, text="Working dir").grid(row=9, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(top, textvariable=self.working_dir_var, width=90).grid(row=9, column=1, sticky=tk.EW, pady=4)
+        ttk.Button(top, text="Browse", command=self.choose_working_dir).grid(row=9, column=2, padx=6, pady=4)
         top.columnconfigure(1, weight=1)
 
         form = ttk.LabelFrame(outer, text="Design Options", padding=10)
         form.pack(fill=tk.X, pady=(12, 0))
 
         ttk.Label(form, text="Ploidy").grid(row=0, column=0, sticky=tk.W, pady=4)
-        ttk.Combobox(form, textvariable=self.ploidy_var, values=["3", "2", "1"], width=12, state="readonly").grid(
-            row=0, column=1, sticky=tk.W, pady=4
+        # v13: 保留引用让 _on_species_changed 能动态改 values（wheat 1/2/3 vs diploid 1）
+        self.ploidy_combo = ttk.Combobox(
+            form, textvariable=self.ploidy_var, values=["3", "2", "1"], width=12, state="readonly"
         )
+        self.ploidy_combo.grid(row=0, column=1, sticky=tk.W, pady=4)
         ttk.Label(form, text="Max enzyme price").grid(row=0, column=2, sticky=tk.W, pady=4)
         ttk.Combobox(
             form,
@@ -410,6 +437,20 @@ class DesktopApp:
     def clear_snp_input(self) -> None:
         self.snp_text.delete("1.0", tk.END)
 
+    def _on_species_changed(self, event=None) -> None:  # noqa: ARG002
+        """v13: species 切换时联动 ploidy 选项 + display_name 标签。
+        wheat 保留 1/2/3 三档；diploid 物种只剩 1（GUI disable 单一值的 combo
+        会让用户看不出可改性，所以保留 readonly state，只让 values 收窄）。"""
+        from core.species import get_species
+        sp = get_species(self.species_var.get())
+        self.ploidy_combo.configure(values=[str(p) for p in sp.ploidy_choices])
+        self.ploidy_var.set(str(sp.default_ploidy))
+        self.species_display_label.configure(text=sp.display_name)
+        self.log(
+            f"Species 切换为 {sp.display_name}（taxid={sp.taxid}）。"
+            f"ploidy={sp.default_ploidy}，ABD filter={sp.use_abd_filter}。"
+        )
+
     def load_example_snp_input(self) -> None:
         # 「替换」语义：先清空再填，避免追加到用户半截编辑过的行后面破坏 polymarker
         # 格式。和启动预填用同一个 _EXAMPLE_SNP_INPUT 常量。
@@ -420,6 +461,8 @@ class DesktopApp:
         for name, value in self._param_defaults.items():
             getattr(self, name).set(value)
         self._refresh_mode_fields()
+        # v13: species 切回后联动 ploidy combo values + display_name label
+        self._on_species_changed()
         self.log("已重置所有参数为默认值")
 
     def log(self, message: str) -> None:
@@ -610,6 +653,7 @@ class DesktopApp:
             remote_database=self.remote_database_var.get().strip() or None,
             remote_fetch_database=remote_fetch_database,
             remote_email=self.remote_email_var.get().strip() or None,
+            species_key=self.species_var.get(),  # v13
         )
 
     def show_plan(self) -> None:

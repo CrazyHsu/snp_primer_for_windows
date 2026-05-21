@@ -158,14 +158,12 @@ def _count_mismatches(query_sequence: str, subject_sequence: str) -> int:
 
 
 def infer_chromosome(text: str) -> str | None:
-    for pattern in (
-        r"\b([1-7][ABD])\b",
-        r"(?:chromosome|chr)\s*([1-7][ABD])\b",
-    ):
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).upper()
-    return None
+    """**v13 起 deprecated wheat-only 别名**——保留以防外部 import 撞名。
+    新代码请走 `core.species.infer_chromosome_for_species(text, species)`，
+    把 species 显式传进去。本函数依赖小麦 `[1-7][ABD]` 正则，对非小麦
+    全返 None。"""
+    from core.species import SPECIES_TABLE, infer_chromosome_for_species
+    return infer_chromosome_for_species(text, SPECIES_TABLE["wheat"])
 
 
 def is_likely_transcript_accession(accession: str) -> bool:
@@ -314,6 +312,17 @@ def run_ncbi_blast(
     email: str | None = None,
     timeout_seconds: int = 1800,
     cancel_event: threading.Event | None = None,
+    # v13: 默认改为 None。由 core/pipeline.py 按用户选的 species 从
+    # core.species.SpeciesConfig.entrez_query 取值喂进来——物种信息只在
+    # core/species.py 单点维护。本函数直接调用不传时 → 不加 ENTREZ_QUERY
+    # （NCBI 端查全库）。详见 v13 CLAUDE.md §6.22。
+    entrez_query: str | None = None,
+    # v14: 在线 NCBI BLAST 的原始 JSON 响应落盘路径。提供时，函数会把 NCBI
+    # 返回的 result_text **逐字节**写到该路径，再从该路径重新读回喂给 parser，
+    # 让"下载文件 = 下游分析输入"在 IO 层面成立（用户排查时直接 diff 这个文件
+    # 跟 NCBI 网页下载的 JSON 即可）。None（默认）走 v13 内存路径，不落盘——
+    # Layer A 测试不传该参数，保持 wheat 字节等价。详见 v14 §6.23。
+    raw_output_path: Path | None = None,
 ) -> list[BlastAlignment]:
     submit_params: dict[str, object] = {
         "CMD": "Put",
@@ -326,6 +335,9 @@ def run_ncbi_blast(
     }
     if email:
         submit_params["EMAIL"] = email
+    if entrez_query:
+        submit_params["ENTREZ_QUERY"] = entrez_query
+        log_message(logger, f"  NCBI ENTREZ_QUERY filter: {entrez_query}")
     submit_text = _http_post(
         NCBI_BLAST_URL,
         submit_params,
@@ -363,6 +375,14 @@ def run_ncbi_blast(
                 logger=logger,
                 description=f"NCBI BLAST result RID={rid}",
             )
+            if raw_output_path is not None:
+                raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_output_path.write_text(result_text, encoding="utf-8")
+                log_message(
+                    logger,
+                    f"  Saved NCBI BLAST raw JSON: {raw_output_path}",
+                )
+                result_text = raw_output_path.read_text(encoding="utf-8")
             return parse_ncbi_json_results(result_text)
         if "Status=FAILED" in status_text or "Status=UNKNOWN" in status_text:
             raise OnlineBlastError(f"NCBI BLAST failed for RID {rid}:\n{status_text}")
@@ -495,21 +515,46 @@ def fetch_ebi_sequence(
 def render_alignment_table_with_chrom_prefix(
     alignments: list[BlastAlignment],
     logger: LogFn | None = None,
+    *,
+    species=None,
+    sample_dropped_limit: int = 5,
 ) -> str:
     """Like render_alignment_table but prefixes subject_id with ``chr{XY}_``
-    using the inferred wheat chromosome. Hits without an inferrable
-    chromosome are dropped (they would have been filtered by getflanking
-    anyway)."""
+    using the inferred chromosome short code for the given species. Hits
+    without an inferrable chromosome are dropped.
+
+    v13: species is `core.species.SpeciesConfig`; defaults to wheat for
+    backward compatibility. chromosome inference is now species-aware
+    (`species.infer_chrom_patterns` drives the regex set).
+
+    Logs total/kept/dropped counts and up to ``sample_dropped_limit`` example
+    (subject_id, subject_title) pairs from the dropped set, so the user can
+    eyeball whether the drops are non-target species (expected when DB is
+    broad), target species without chromosome notation (expected for
+    cDNA/EST entries), or target species hits whose chromosome the regex
+    missed (real bug — file an issue with the sample titles)."""
+    from core.species import get_species, infer_chromosome_for_species
+    sp = species if species is not None else get_species("wheat")
     rewritten: list[BlastAlignment] = []
+    dropped_samples: list[tuple[str, str]] = []
     dropped = 0
     for a in alignments:
-        if not a.subject_chromosome:
+        # v13: 不再读 a.subject_chromosome（_alignment_from_hsp 仍在填它但走的是
+        # wheat-only infer_chromosome alias，对非小麦无效）。这里按 species 现算。
+        chrom = infer_chromosome_for_species(
+            f"{a.subject_id} {a.subject_title or ''}", sp
+        )
+        if not chrom:
             dropped += 1
+            if len(dropped_samples) < sample_dropped_limit:
+                dropped_samples.append(
+                    (a.subject_id, (a.subject_title or "")[:200])
+                )
             continue
         rewritten.append(
             BlastAlignment(
                 query_id=a.query_id,
-                subject_id=f"chr{a.subject_chromosome}_{a.subject_id}",
+                subject_id=f"chr{chrom}_{a.subject_id}",
                 alignment_length=a.alignment_length,
                 mismatches=a.mismatches,
                 gap_opens=a.gap_opens,
@@ -521,15 +566,32 @@ def render_alignment_table_with_chrom_prefix(
                 subject_sequence=a.subject_sequence,
                 subject_length=a.subject_length,
                 subject_title=a.subject_title,
-                subject_chromosome=a.subject_chromosome,
+                subject_chromosome=chrom,
             )
         )
-    if dropped:
-        log_message(logger, f"Dropped {dropped} hit(s) with no inferrable wheat chromosome")
+    kept = len(rewritten)
+    total = kept + dropped
+    if total:
+        # v13: species-aware label，避免日志写死 "wheat chrom 1-7 A/B/D" 误导
+        log_message(
+            logger,
+            f"BLAST hits: total={total}, kept ({sp.display_name} chrom)={kept}, "
+            f"dropped (no inferrable chromosome for {sp.key})={dropped}",
+        )
+    if dropped_samples:
+        log_message(
+            logger,
+            f"  Sample dropped hits (showing first {len(dropped_samples)}):",
+        )
+        for sid, stitle in dropped_samples:
+            log_message(logger, f"    - {sid}  |  {stitle}")
     return render_alignment_table(rewritten)
 
 
-_CHROM_PREFIXED_RE = re.compile(r"^chr([1-7][ABD])_(.+)$")
+# v13: 通用 chr 前缀正则——chr 开头 + 1-3 个 [A-Za-z0-9] + 下划线 + accession 余下。
+# 涵盖小麦 "chr7A_NC_xxx"、大麦 "chr5H_NC_xxx"、水稻 "chr12_NC_xxx" 等。
+# 旧的 wheat-only `r"^chr([1-7][ABD])_(.+)$"` 反解器 v13 起被这条替换。
+_CHROM_PREFIXED_RE = re.compile(r"^chr([A-Za-z0-9]{1,3})_(.+)$")
 
 
 def split_chrom_prefixed_subject(subject: str) -> tuple[str | None, str]:
@@ -537,6 +599,10 @@ def split_chrom_prefixed_subject(subject: str) -> tuple[str | None, str]:
 
     Returns ``(chrom_short_or_None, original_accession)``. Subjects not in
     rewritten form are returned unchanged with ``chrom_short_or_None = None``.
+
+    v13: 通用化为 [A-Za-z0-9]{1,3} 短码，跨物种工作。不再 hard-validate
+    against species.valid_chrom_codes——宽松反解 + 让 pipeline 跑通，比硬卡
+    更友好。
     """
     m = _CHROM_PREFIXED_RE.match(subject)
     if not m:

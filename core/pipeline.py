@@ -703,6 +703,7 @@ def run(*,
         remote_fetch_database=None,
         remote_email=None,
         cancel_event=None,
+        species_key="wheat",  # v13: 用户选的物种 key，详见 v13 CLAUDE.md §6.22
         log=print):
     """
     跑完整 SNP 引物设计流程。
@@ -750,6 +751,8 @@ def run(*,
         ``"provider_online"`` + ``remote_provider="ebi"`` → 通过
         ``run_ebi_blast`` 提交到 EBI；flanking 用 dbfetch 取（需 ``remote_email``）。
         online 模式下 ``reference_db`` / ``reference_fasta`` 会被忽略。
+        **ncbi_online 模式会自动在 NCBI 端加 ENTREZ_QUERY=txid4565[ORGN]
+        小麦物种过滤**（pipeline 整体为小麦专用，详见 v12 CLAUDE.md §6.21）。
     remote_provider, remote_database, remote_fetch_database, remote_email : str | None
         online 模式参数。``remote_database`` 是 NCBI/EBI 上的库名（``core_nt`` /
         ``refseq_genomes`` / ``em_rel``...）。``remote_fetch_database`` 仅 EBI
@@ -769,6 +772,11 @@ def run(*,
         input_csv = str(Path(input_csv).resolve())
     elif flanking_files is None:
         raise ValueError("必须提供 input_csv 或 flanking_files 至少一个")
+
+    # v13: resolve species 单次后到处用。"wheat" 默认 → pre-v13 byte-equiv。
+    from core.species import get_species
+    species = get_species(species_key)
+    log(f"物种：{species.display_name} (taxid={species.taxid})")
 
     bin_dir_str = str(Path(bin_dir).resolve()) if bin_dir else None
     # 把 bin_dir 注入到 getCAPS / getkasp3 那条 subprocess.call 链路的 PATH 上，
@@ -923,17 +931,26 @@ def run(*,
                 from snp_primer_app.online_blast import (
                     run_ncbi_blast,
                     run_ebi_blast,
+                    render_alignment_table,
                     render_alignment_table_with_chrom_prefix,
                 )
                 query_fasta = Path("for_blast.fa").read_text(encoding="utf-8")
                 log(f"Step 2: 在线 BLAST 模式={blast_mode} db={remote_database}")
                 if blast_mode == "ncbi_online":
+                    # v14: raw_output_path 让在线 NCBI BLAST 把 JSON 响应逐字节
+                    # 写到 ncbi_blast_raw.json，再从该文件回读喂 parser；保证
+                    # "下载的文件 = 下游分析输入"在 IO 层面成立，方便用户直接
+                    # diff 这个文件跟 NCBI 网页下载的 JSON。详见 v14 §6.23。
                     alignments = run_ncbi_blast(
                         query_fasta,
                         remote_database,
                         logger=log,
                         email=remote_email,
                         cancel_event=cancel_event,
+                        # v13: species 驱动 ENTREZ_QUERY（小麦 txid4565[ORGN] / 大麦
+                        # txid4513[ORGN] / ...）。详见 v13 CLAUDE.md §6.22。
+                        entrez_query=species.entrez_query,
+                        raw_output_path=Path("ncbi_blast_raw.json"),
                     )
                 else:  # provider_online → EBI（已在校验阶段限定）
                     alignments = run_ebi_blast(
@@ -943,7 +960,21 @@ def run(*,
                         logger=log,
                         cancel_event=cancel_event,
                     )
-                table = render_alignment_table_with_chrom_prefix(alignments, logger=log)
+                # v14: 在按染色体正则过滤之前，把全部 hit 落盘成 15 列 TSV，方便
+                # 用户回溯"为什么这条 hit 被 drop"——格式与 blast_out.txt 一致，可
+                # 直接 diff 前后两表。
+                all_hits_table = render_alignment_table(alignments)
+                Path("ncbi_blast_all_hits.tsv").write_text(
+                    all_hits_table, encoding="utf-8"
+                )
+                log(
+                    f"Step 2: 写入 {len(all_hits_table.splitlines())} 行 "
+                    f"ncbi_blast_all_hits.tsv（pre-filter audit table）"
+                )
+                # v13: 把 species 喂给 chr-prefix render，让染色体正则按物种走
+                table = render_alignment_table_with_chrom_prefix(
+                    alignments, logger=log, species=species
+                )
                 Path("blast_out.txt").write_text(table, encoding="utf-8")
                 log(f"Step 2 完成：写入 {len(table.splitlines())} 行 blast_out.txt")
             else:
@@ -977,7 +1008,8 @@ def run(*,
             getflanking.flanking(polymarker_csv_in_workdir,
                                  "blast_out.txt",
                                  "temp_range.txt",
-                                 int(ploidy))
+                                 int(ploidy),
+                                 species=species)  # v13
             if Path("temp_range.txt").stat().st_size == 0:
                 log("temp_range.txt 是空的；所有 SNP 都被过滤掉了。")
                 with open("Potential_CAPS_primers.tsv", "w") as f:

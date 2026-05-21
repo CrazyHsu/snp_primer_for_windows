@@ -100,6 +100,9 @@ class PipelineRequest:
     remote_database: str | None = None
     remote_fetch_database: str | None = None
     remote_email: str | None = None
+    # v13: 用户在 GUI 选的物种 key（core.species.SPECIES_TABLE 的 key，默认 "wheat"
+    # 保留 v12 行为字节等价）。详见 v13 CLAUDE.md §6.22。
+    species_key: str = "wheat"
 
 
 @dataclass(frozen=True)

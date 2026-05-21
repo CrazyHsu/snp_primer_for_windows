@@ -14,20 +14,28 @@ import sys
 from collections import Counter
 
 
-def _extract_chrom_short(subject):
+def _extract_chrom_short(subject, species=None):
 	"""
-	从 BLAST subject 名提取 2 字符的染色体短名（如 "7A"、"Un"）。
+	从 BLAST subject 名提取染色体短名。
 
 	兼容两种格式：
 	- 上游注释里说的 "chr6A" 这种短名 → 直接取末 2 个字符
 	- wheatomics 用的 "chr7A_Chinese_Spring1.0" 这种长名 →
 	  取 "chr" 后面 2 个字符
+
+	v13: 加 species 参数。wheat / barley 仍然 2 字符截断（"7A"、"5H"）；
+	非 wheat 且 use_abd_filter=False（rice/maize/sorghum/arabidopsis）返回完整
+	1-3 字符短码（"12"、"5"），不截到 2 字符。species=None 时回退 wheat 行为
+	（保留 pre-v13 字节等价）。
 	"""
 	if subject.startswith("chr"):
 		rest = subject[3:]
 		m = re.match(r"^([A-Za-z0-9]{1,3})(?:_|$|\.)", rest)
 		if m:
-			return m.group(1)[:2]
+			code = m.group(1)
+			if species is None or species.use_abd_filter:
+				return code[:2]  # wheat 行为：截 2 字符
+			return code  # 非小麦：返回完整短码
 	return subject[-2:]
 
 
@@ -55,18 +63,31 @@ def _parse_polymarker_for_pos(polymarker_input):
     return snp_pos
 
 
-def flanking(polymarker_input, blast_file, outfile, genome_number):
+def flanking(polymarker_input, blast_file, outfile, genome_number, species=None):
     """
     polymarker_input: parse_polymarker 的原始输入
     blast_file: blastn 输出（outfmt "6 std qseq sseq slen"）
     outfile: 输出文件 temp_range.txt
-    genome_number: 1/2/3，对应 A / AB / ABD
-    """
-    if genome_number not in [1, 2, 3]:
-        raise ValueError("genome_number must be 1, 2, or 3")
+    genome_number: wheat 1/2/3 对应 A / AB / ABD；非小麦 diploid 用 1
+    species: core.species.SpeciesConfig。v13 加。None 时回退 wheat 行为
+             （pre-v13 字节等价）。
 
-    genomes = "ABD"
-    genomes = genomes[:genome_number] + "n"  # 加上 chrUn
+    v13 变更：species.use_abd_filter=True (wheat) 走 pre-v13 ABD 过滤路径；
+    use_abd_filter=False (barley/rice/maize/sorghum/arabidopsis) 跳过 subgenome
+    过滤，所有 BLAST hit chromosome 都允许进入下一步同染色体匹配。
+    """
+    # 延迟 import 避免 PYTHONPATH 还没有 src/ 时的导入问题（Layer A 测试场景）
+    if species is None:
+        from core.species import get_species
+        species = get_species("wheat")
+
+    if species.use_abd_filter:
+        if genome_number not in [1, 2, 3]:
+            raise ValueError("genome_number must be 1, 2, or 3 for wheat")
+        genomes = "ABD"
+        genomes = genomes[:genome_number] + "n"  # 加上 chrUn (wheat 行为，pre-v13 字节等价)
+    else:
+        genomes = None  # 非小麦：跳过 subgenome 过滤
 
     snp_pos = _parse_polymarker_for_pos(polymarker_input)
 
@@ -88,9 +109,11 @@ def flanking(polymarker_input, blast_file, outfile, genome_number):
             query, subject = fields[:2]
             snp, qchrom = query.split("_")[0:2]
             qchrom = qchrom[0:2]
-            schrom = _extract_chrom_short(subject)
-            if schrom[1] not in genomes:
-                continue
+            schrom = _extract_chrom_short(subject, species=species)
+            # v13: genomes 为 None 表示非小麦，跳过 subgenome 过滤
+            if genomes is not None:
+                if len(schrom) < 2 or schrom[1] not in genomes:
+                    continue
             pct_identity = 100 - (float(fields[4]) + float(fields[5])) / float(fields[3]) * 100
             align_length = int(fields[3])
             if snp not in snp_size_list:
